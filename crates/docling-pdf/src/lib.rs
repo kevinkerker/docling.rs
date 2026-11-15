@@ -1981,8 +1981,13 @@ impl Worker {
                 .filter(|(_, r)| assemble::is_table_like(r.label))
                 .map(|(i, r)| (i, [r.l, r.t, r.r, r.b]))
                 .unzip();
-            let rows =
-                tf.predict_tables_on(page.image.height(), &page1024, &boxes, &page.word_cells);
+            let rows = tf.predict_tables_on(
+                page.image.height(),
+                page.scale,
+                &page1024,
+                &boxes,
+                &page.word_cells,
+            );
             for (i, grid) in idx.into_iter().zip(rows) {
                 table_rows[i] = grid;
             }

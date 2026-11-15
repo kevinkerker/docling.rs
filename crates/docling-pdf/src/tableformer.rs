@@ -1104,7 +1104,8 @@ impl TableFormer {
     /// match the page's word cells into the predicted cells with docling's
     /// matching post-processor ([`crate::tf_match`]) and expand spans into a
     /// dense `rows × cols` grid. `region` is `(l, t, r, b)` in page points
-    /// (top-left). Returns `None` if no structure is predicted.
+    /// (top-left), `page_image` the page rendered at 2 px per point. Returns
+    /// `None` if no structure is predicted.
     pub fn predict_table_rows(
         &mut self,
         page_image: &RgbImage,
@@ -1112,7 +1113,7 @@ impl TableFormer {
         words: &[TextCell],
     ) -> Option<crate::tf_core::TableGrid> {
         let page1024 = Self::page_1024(page_image);
-        self.predict_table_rows_on(page_image.height(), &page1024, region, words)
+        self.predict_table_rows_on(page_image.height(), 2.0, &page1024, region, words)
     }
 
     /// The page rendered at 1024 px height (cv2.INTER_AREA), the frame every
@@ -1130,15 +1131,18 @@ impl TableFormer {
 
     /// [`predict_table_rows`](Self::predict_table_rows) with the page's
     /// 1024-px frame already built ([`page_1024`](Self::page_1024));
-    /// `page_h` is the source page image's pixel height.
+    /// `page_h` is the source page image's pixel height and `scale` its
+    /// pixels per page unit (2.0 for a rendered PDF page, 1.0 for a
+    /// standalone image, which is its own page).
     pub fn predict_table_rows_on(
         &mut self,
         page_h: u32,
+        scale: f32,
         page1024: &RgbImage,
         region: [f32; 4],
         words: &[TextCell],
     ) -> Option<crate::tf_core::TableGrid> {
-        let crop = Self::crop_region(page_h, page1024, region)?;
+        let crop = Self::crop_region(page_h, scale, page1024, region)?;
         let cells = crate::timing::timed("tableformer.structure", || {
             self.predict_table_structure(&crop)
         })
@@ -1163,6 +1167,7 @@ impl TableFormer {
     pub fn predict_tables_on(
         &mut self,
         page_h: u32,
+        scale: f32,
         page1024: &RgbImage,
         regions: &[[f32; 4]],
         words: &[TextCell],
@@ -1171,7 +1176,7 @@ impl TableFormer {
         let crops: Vec<(usize, RgbImage)> = regions
             .iter()
             .enumerate()
-            .filter_map(|(i, r)| Self::crop_region(page_h, page1024, *r).map(|c| (i, c)))
+            .filter_map(|(i, r)| Self::crop_region(page_h, scale, page1024, *r).map(|c| (i, c)))
             .collect();
         if self.batched && crops.len() > 1 {
             let batched = crate::timing::timed("tableformer.structure", || {
@@ -1228,10 +1233,18 @@ impl TableFormer {
     /// scaled by 2 (its table-structure page scale), then by `1024 / <2x
     /// page-image height>`, and the crop indices round again. Rounding after
     /// scaling instead shifts some crops by a pixel — enough to change
-    /// TableFormer's cell boxes on tall tables (redp5110's TOC). `None` for a
-    /// region that collapses to an empty crop.
-    fn crop_region(page_h: u32, page1024: &RgbImage, region: [f32; 4]) -> Option<RgbImage> {
-        let k = 2.0 * 1024.0 / page_h as f64;
+    /// TableFormer's cell boxes on tall tables (redp5110's TOC). `scale` is
+    /// the page image's pixels per page unit: a standalone image page is
+    /// rendered at 1.0, and with the PDF factor of 2 its crop landed at
+    /// twice the region's coordinates. `None` for a region that collapses to
+    /// an empty crop.
+    fn crop_region(
+        page_h: u32,
+        scale: f32,
+        page1024: &RgbImage,
+        region: [f32; 4],
+    ) -> Option<RgbImage> {
+        let k = scale as f64 * 1024.0 / page_h as f64;
         let px = |v: f32| (v as f64).round_ties_even() * k;
         let x = (px(region[0]).round_ties_even()).max(0.0) as u32;
         let y = (px(region[1]).round_ties_even()).max(0.0) as u32;
@@ -1287,5 +1300,27 @@ mod bbox_chunk_tests {
             assert_eq!(chunks.concat(), h, "n={n}");
             assert_eq!(chunks.len(), n.div_ceil(BBOX_CHUNK_CELLS));
         }
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    /// The crop covers the table region at any page-image scale: a PDF page
+    /// rendered at 2 px/pt and a standalone image (its own page at 1 px per
+    /// unit) holding the same table cut out the same pixels.
+    #[test]
+    fn crop_follows_the_page_image_scale() {
+        // A 1000 × 2000 px page image: its 1024-px frame is 512 × 1024.
+        let page1024 = RgbImage::new(512, 1024);
+        let crop = |scale: f32, region: [f32; 4]| {
+            let c = TableFormer::crop_region(2000, scale, &page1024, region).expect("crop");
+            c.dimensions()
+        };
+        // An image page: region in pixels, 0.512 px per unit in the frame.
+        assert_eq!(crop(1.0, [100.0, 200.0, 300.0, 600.0]), (103, 205));
+        // The same table on a PDF page of 500 × 1000 pt rendered at 2 px/pt.
+        assert_eq!(crop(2.0, [50.0, 100.0, 150.0, 300.0]), (103, 205));
     }
 }
