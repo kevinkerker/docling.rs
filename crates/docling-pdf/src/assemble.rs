@@ -4162,16 +4162,24 @@ pub fn assemble_page(
         }
     }
     let mut merge_suffix: Vec<String> = vec![String::new(); regions.len()];
+    // Each merged fragment keeps its own box, as docling's `_merge_elements`
+    // appends one `prov` per fragment: the region and its `charspan` in the
+    // joined text.
+    let mut merge_provs: Vec<Vec<(usize, [usize; 2])>> = vec![Vec::new(); regions.len()];
     for (head, children) in
         crate::reading_order::predict_merges(&boxes, &region_texts, &is_text, &is_skip)
             .into_iter()
             .enumerate()
     {
+        let mut len = region_texts[head].chars().count();
         for c in children {
             let t = region_texts[c].trim();
             if !t.is_empty() {
                 merge_suffix[head].push(' ');
                 merge_suffix[head].push_str(t);
+                let start = len + 1;
+                len = start + t.chars().count();
+                merge_provs[head].push((c, [start, len]));
             }
             consumed[c] = true;
         }
@@ -4579,7 +4587,19 @@ pub fn assemble_page(
                     }
                     Node::Paragraph { text: escaped }
                 };
-                nodes.push(located(loc, node))
+                nodes.push(located(loc, node));
+                // The fragments joined into the next column: one more `prov`
+                // each, on this page (#1127's marker, no page break between).
+                let mut prev_end = region_texts[i].chars().count();
+                for &(c, span) in &merge_provs[i] {
+                    nodes.push(Node::ProvContinuation {
+                        location: norm_loc(&regions[c], page.width, page_h),
+                        prev_end,
+                        span,
+                        page_skip: 0,
+                    });
+                    prev_end = span[1];
+                }
             }
         }
     }
@@ -4746,7 +4766,9 @@ fn rotate_nodes_to_display(nodes: &mut [Node], rot: u16) {
                     rot_loc(l);
                 }
             }
-            Node::PageFurniture { location, .. } => rot_loc(location),
+            Node::PageFurniture { location, .. } | Node::ProvContinuation { location, .. } => {
+                rot_loc(location)
+            }
             Node::Table(t) => {
                 if let Some(l) = &mut t.location {
                     rot_loc(l);
@@ -4983,17 +5005,17 @@ fn merge_open_paragraphs(nodes: &mut Vec<Node>, how: Continuations) {
             // located continuation leaves a marker right after the paragraph
             // (behind any from earlier joins) with its box, its page counted in
             // page markers, and the `charspan`s of the join.
+            // `merged` is the head's text, the join (a space, or nothing
+            // after a split word), then `b`.
+            let head = merged.strip_suffix(b.as_str()).unwrap_or(&merged);
+            let page_skip = nodes[i + 1..j]
+                .iter()
+                .filter(|n| matches!(n, Node::PageInfo { .. }))
+                .count();
             let marker = match &nodes[j] {
                 Node::Located { location, .. }
                     if new_page && matches!(nodes[i], Node::Located { .. }) =>
                 {
-                    // `merged` is the head's text, the join (a space, or
-                    // nothing after a split word), then `b`.
-                    let head = merged.strip_suffix(b.as_str()).unwrap_or(&merged);
-                    let page_skip = nodes[i + 1..j]
-                        .iter()
-                        .filter(|n| matches!(n, Node::PageInfo { .. }))
-                        .count();
                     Some(Node::ProvContinuation {
                         location: *location,
                         prev_end: docling_core::text_char_len(head.trim_end()),
@@ -5006,6 +5028,32 @@ fn merge_open_paragraphs(nodes: &mut Vec<Node>, how: Continuations) {
                 }
                 _ => None,
             };
+            // The continuation's own markers (its joins into the next column)
+            // go with it: shifted to where its text starts in `merged` and
+            // counted from the head's page.
+            let lead = as_paragraph(&nodes[j]).map_or(0, |t| {
+                docling_core::text_char_len(t) - docling_core::text_char_len(&b)
+            });
+            let offset = docling_core::text_char_len(head).saturating_sub(lead);
+            let own = nodes[j + 1..]
+                .iter()
+                .take_while(|n| matches!(n, Node::ProvContinuation { .. }))
+                .count();
+            let mut moved: Vec<Node> = nodes.drain(j + 1..j + 1 + own).collect();
+            for m in &mut moved {
+                if let Node::ProvContinuation {
+                    prev_end,
+                    span,
+                    page_skip: skip,
+                    ..
+                } = m
+                {
+                    *prev_end += offset;
+                    span[0] += offset;
+                    span[1] += offset;
+                    *skip += page_skip;
+                }
+            }
             nodes[i] = reparagraph(&nodes[i], merged);
             nodes.remove(j);
             if let Some(marker) = marker {
@@ -5025,6 +5073,15 @@ fn merge_open_paragraphs(nodes: &mut Vec<Node>, how: Continuations) {
                     span[1] = *prev_end;
                 }
                 nodes.insert(at, marker);
+            }
+            if !moved.is_empty() {
+                let at = i
+                    + 1
+                    + nodes[i + 1..]
+                        .iter()
+                        .take_while(|n| matches!(n, Node::ProvContinuation { .. }))
+                        .count();
+                nodes.splice(at..at, moved);
             }
             // Re-check i: the merged paragraph may continue further.
         } else {
@@ -6992,6 +7049,84 @@ mod tests {
             .collect();
         assert_eq!(doc.export_to_markdown(), plain.export_to_markdown());
         assert_eq!(doc.export_to_doclang(), plain.export_to_doclang());
+    }
+
+    /// A paragraph `predict_merges` joined into the next column keeps that
+    /// column's box as a second `prov` on the same page (`page_skip` 0), and
+    /// a later join across a page break carries the continuation's own
+    /// column joins along, shifted into the joined text.
+    #[test]
+    fn same_page_column_join_keeps_each_fragments_prov() {
+        let loc = |x: u16, y: u16, text: &str| super::located([x, y, x + 200, y + 40], para(text));
+        let mark = |x: u16, y: u16, prev_end: usize, span: [usize; 2]| Node::ProvContinuation {
+            location: [x, y, x + 200, y + 40],
+            prev_end,
+            span,
+            page_skip: 0,
+        };
+        // Page 1: "left column" joined with "right column end of" (as the
+        // page assembler emits it); page 2: "page, then" + "more text".
+        let nodes = vec![
+            page(1),
+            loc(20, 400, "left column right column end of"),
+            mark(270, 20, 11, [12, 31]),
+            page(2),
+            loc(20, 20, "page, then more text"),
+            mark(270, 20, 10, [11, 20]),
+        ];
+        let mut merged = nodes.clone();
+        merge_continuations(&mut merged, Continuations::AcrossPages);
+        let text = "left column right column end of page, then more text";
+        assert_eq!(merged[1], loc(20, 400, text));
+        let head = "left column right column end of ".chars().count();
+        assert_eq!(merged[2], mark(270, 20, 11, [12, 31]));
+        assert_eq!(
+            merged[3],
+            Node::ProvContinuation {
+                location: [20, 20, 220, 60],
+                prev_end: head - 1,
+                span: [head, text.chars().count()],
+                page_skip: 1,
+            }
+        );
+        assert_eq!(
+            merged[4],
+            Node::ProvContinuation {
+                location: [270, 20, 470, 60],
+                prev_end: head + 10,
+                span: [head + 11, head + 20],
+                page_skip: 1,
+            }
+        );
+        assert_eq!(merged[5], page(2));
+        assert_stream_eq_under(&nodes, &[3], Continuations::AcrossPages);
+
+        let mut doc = docling_core::DoclingDocument::new("t");
+        doc.nodes = merged;
+        let json = doc.export_to_json_value();
+        let prov = json["texts"][0]["prov"].as_array().expect("prov");
+        let at: Vec<_> = prov
+            .iter()
+            .map(|p| {
+                (
+                    p["page_no"].as_u64().unwrap(),
+                    p["bbox"]["l"].as_f64().unwrap(),
+                    [0, 1].map(|k| p["charspan"][k].as_u64().unwrap() as usize),
+                )
+            })
+            .collect();
+        let total = text.chars().count();
+        // The grid x denormalized against the 600 pt page, to 2 decimals.
+        let l = |x: f64| (x * 600.0 / 512.0 * 100.0).round() / 100.0;
+        assert_eq!(
+            at,
+            [
+                (1, l(20.0), [0, 11]),
+                (1, l(270.0), [12, head - 1]),
+                (2, l(20.0), [head, head + 10]),
+                (2, l(270.0), [head + 11, total]),
+            ]
+        );
     }
 
     fn item(text: &str) -> Node {

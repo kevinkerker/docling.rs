@@ -489,10 +489,11 @@ pub enum Node {
         height: f32,
     },
     /// One more provenance fragment of the last located text item before it
-    /// (#1127): a PDF paragraph the assembler joined across a page break keeps
-    /// the continuation's box this way, as an invisible marker right after the
-    /// joined paragraph; its grid box is on the page `page_skip` page markers
-    /// further on, numbered and sized like every other location there.
+    /// (#1127): a PDF paragraph the assembler joined across a page break, or
+    /// into the next column of its page, keeps the continuation's box this
+    /// way, as an invisible marker right after the joined paragraph; its grid
+    /// box is on the page `page_skip` page markers further on (0 = the item's
+    /// own page), numbered and sized like every other location there.
     /// docling's merged `TextItem` lists one `prov` per fragment
     /// (`ReadingOrderModel`: the first fragment's, then each continuation's
     /// with its `charspan` into the joined text); the JSON export appends this

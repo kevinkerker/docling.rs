@@ -1658,38 +1658,45 @@ impl Builder {
                 self.pending_continuations.push(p);
                 continue;
             }
-            let PendingContinuation {
-                item: idx,
-                location: loc,
-                prev_end,
-                span,
-                ..
-            } = p;
-            if self.cur_page == 0 || loc == [0, 0, 0, 0] {
-                continue;
-            }
-            let [l, t, r, b] = self.grid_bbox(loc);
-            let page_no = self.cur_page;
-            let Some(item) = self.texts.get_mut(idx).map(|it| it.value_mut(idx)) else {
-                continue;
-            };
-            // Clamped to the item's text: a later pass (the wrap-mark strip,
-            // redaction) may have shortened it since the assembler counted.
-            let total = item["text"].as_str().map_or(0, |t| t.chars().count());
-            let Some(provs) = item.get_mut("prov").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            // No first fragment to continue: the item has no geometry.
-            let Some(last) = provs.last_mut() else {
-                continue;
-            };
-            last["charspan"][1] = json!(prev_end.min(total));
-            provs.push(json!({
-                "page_no": page_no,
-                "bbox": {"l": l, "t": t, "r": r, "b": b, "coord_origin": "BOTTOMLEFT"},
-                "charspan": [span[0].min(total), span[1].min(total)],
-            }));
+            self.add_continuation(p);
         }
+    }
+
+    /// One [`Node::ProvContinuation`] fragment on the current page: its
+    /// item's last `prov` entry ends at `prev_end`, and the fragment's box
+    /// follows as one more entry.
+    fn add_continuation(&mut self, p: PendingContinuation) {
+        let PendingContinuation {
+            item: idx,
+            location: loc,
+            prev_end,
+            span,
+            ..
+        } = p;
+        if self.cur_page == 0 || loc == [0, 0, 0, 0] {
+            return;
+        }
+        let [l, t, r, b] = self.grid_bbox(loc);
+        let page_no = self.cur_page;
+        let Some(item) = self.texts.get_mut(idx).map(|it| it.value_mut(idx)) else {
+            return;
+        };
+        // Clamped to the item's text: a later pass (the wrap-mark strip,
+        // redaction) may have shortened it since the assembler counted.
+        let total = item["text"].as_str().map_or(0, |t| t.chars().count());
+        let Some(provs) = item.get_mut("prov").and_then(Value::as_array_mut) else {
+            return;
+        };
+        // No first fragment to continue: the item has no geometry.
+        let Some(last) = provs.last_mut() else {
+            return;
+        };
+        last["charspan"][1] = json!(prev_end.min(total));
+        provs.push(json!({
+            "page_no": page_no,
+            "bbox": {"l": l, "t": t, "r": r, "b": b, "coord_origin": "BOTTOMLEFT"},
+            "charspan": [span[0].min(total), span[1].min(total)],
+        }));
     }
 
     /// Adopt a node's own location field (tables, formulas, list items carry
@@ -2525,7 +2532,8 @@ impl Builder {
             // Page breaks are DocLang-only; docling omits them from the JSON body.
             Node::PageBreak => None,
             // A continuation fragment of the item just written (#1127): its box
-            // is on a later page, resolved when that page's marker comes.
+            // is on a later page, resolved when that page's marker comes, or
+            // on this page (a join into the next column), added now.
             Node::ProvContinuation {
                 location,
                 prev_end,
@@ -2533,13 +2541,18 @@ impl Builder {
                 page_skip,
             } => {
                 if let Some(idx) = self.last_text.filter(|_| self.cur_page > 0) {
-                    self.pending_continuations.push(PendingContinuation {
+                    let p = PendingContinuation {
                         item: idx,
                         skip: *page_skip,
                         location: *location,
                         prev_end: *prev_end,
                         span: *span,
-                    });
+                    };
+                    if *page_skip == 0 {
+                        self.add_continuation(p);
+                    } else {
+                        self.pending_continuations.push(p);
+                    }
                 }
                 None
             }
