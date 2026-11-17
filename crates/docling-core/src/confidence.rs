@@ -85,13 +85,25 @@ pub fn nanquantile(values: &[Option<f64>], q: f64) -> Option<f64> {
     Some(known[lo] * (1.0 - frac) + known[hi] * frac)
 }
 
-/// One page's confidence scores (docling's `PageConfidenceScores`).
+/// One page's confidence scores (docling's `PageConfidenceScores`), plus
+/// where the page's text-layer text comes from.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PageConfidence {
     pub parse_score: Option<f64>,
     pub layout_score: Option<f64>,
     pub table_score: Option<f64>,
     pub ocr_score: Option<f64>,
+    /// The page's text-layer text is a scan's OCR layer: nine in ten of its
+    /// glyphs drawn invisibly over, or hidden under, the page's images —
+    /// what an OCR tool adds to a scanned page — rather than a digital
+    /// page's text.
+    /// Text this pipeline recognised itself shows in `ocr_score` and
+    /// [`ConfidenceReport::ocr_cells`] instead; a page can have both (an
+    /// OCR'd region on a scan with a layer). `false` for a page whose layer
+    /// was replaced by OCR (force-OCR, a broken layer) and for non-PDF
+    /// inputs. A docling.rs extension: no score, not in [`ConfidenceReport::to_json`]
+    /// (docling's wire shape).
+    pub scanned_text_layer: bool,
 }
 
 impl PageConfidence {
@@ -331,6 +343,7 @@ mod tests {
                 layout_score: Some(0.9),
                 table_score: None,
                 ocr_score: None,
+                scanned_text_layer: false,
             },
         );
         pages.insert(
@@ -340,9 +353,15 @@ mod tests {
                 layout_score: Some(0.7),
                 table_score: None,
                 ocr_score: Some(0.8),
+                scanned_text_layer: true,
             },
         );
         let report = ConfidenceReport::from_pages(pages);
+        // The scan flag rides along per page, outside docling's wire shape.
+        assert!(report.pages[&2].scanned_text_layer);
+        assert!(report.to_json()["pages"]["2"]
+            .get("scanned_text_layer")
+            .is_none());
         // layout: mean(0.9, 0.7); ocr: mean over the one page that has it.
         assert_eq!(report.layout_score(), Some(0.8));
         assert_eq!(report.ocr_score(), Some(0.8));

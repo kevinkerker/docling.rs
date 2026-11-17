@@ -912,6 +912,17 @@ fn bitmap_regions(
 }
 
 #[cfg(feature = "ml")]
+/// Drop the page's text layer for OCR to read the page in its place
+/// (force-OCR, a broken layer): its cells, and the scan flag with them —
+/// the page's text is the OCR's now.
+fn discard_text_layer(page: &mut PdfPage) {
+    page.cells.clear();
+    page.code_cells.clear();
+    page.word_cells.clear();
+    page.scanned_text_layer = false;
+}
+
+#[cfg(feature = "ml")]
 /// The OCR'd cells with their recognition confidence, for the per-cell report
 /// (#915): a copy of what feeds the page `ocr_score`, kept beside it.
 fn cell_confs(scored: &[(TextCell, f32)]) -> Vec<docling_core::OcrCellConfidence> {
@@ -977,7 +988,8 @@ fn text_only_page(
     assemble::add_orphan_regions(&mut regions, &page.cells);
     let table_rows = vec![None; regions.len()];
     let enrich_out = vec![None; regions.len()];
-    let conf = quality::page_confidence(parse, &regions, &[]);
+    let mut conf = quality::page_confidence(parse, &regions, &[]);
+    conf.scanned_text_layer = page.scanned_text_layer;
     let (nodes, links) = timing::timed("assemble_page", || {
         assemble::assemble_page(page, regions, &table_rows, &enrich_out, images_scale)
     });
@@ -2087,9 +2099,7 @@ impl Worker {
         let ocr_scale = page_ocr_scale(self.ocr_scale, page.width, page.height, page.scale);
         let mut ocr_view: Option<image::RgbImage> = None;
         if self.force_full_page_ocr || replace_broken {
-            page.cells.clear();
-            page.code_cells.clear();
-            page.word_cells.clear();
+            discard_text_layer(page);
         }
         if replace_broken {
             // The bitmap was judged on the text layer just discarded (a prose
@@ -2701,7 +2711,8 @@ impl Worker {
             .filter(|(_, p)| p.is_none())
             .map(|(r, _)| r.clone())
             .collect();
-        let conf = quality::page_confidence(parse, &elements, &ocr_confs);
+        let mut conf = quality::page_confidence(parse, &elements, &ocr_confs);
+        conf.scanned_text_layer = page.scanned_text_layer;
         let (nodes, links) = timing::timed("assemble_page", || {
             assemble::assemble_page(page, regions, &table_rows, &enrich_out, self.images.scale)
         });
@@ -4438,6 +4449,7 @@ impl Pipeline {
             links: Vec::new(),
             rotation: 0,
             keep_typography: false,
+            scanned_text_layer: false,
             #[cfg(feature = "render")]
             embedded_images: Vec::new(),
             pending_image: None,
@@ -4978,5 +4990,46 @@ mod bitmap_region_tests {
             }))
             .collect();
         assert!(bitmap_regions(&[line, para], &cells, &[PAGE]).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "ml"))]
+mod scanned_text_layer_tests {
+    use super::{discard_text_layer, text_only_page, PdfPage, TextCell};
+
+    /// The page's report carries whether its text layer is a scan's, next to
+    /// its scores, on the text-layer path; the ML path sets it the same way
+    /// in `complete_page`.
+    #[test]
+    fn the_page_report_says_whether_its_layer_is_a_scans() {
+        let cell = TextCell {
+            text: "Recognised words".into(),
+            l: 72.0,
+            t: 100.0,
+            r: 300.0,
+            b: 114.0,
+        };
+        let mut page = PdfPage::from_cells(612.0, 792.0, 1.0, vec![cell]);
+        assert!(!text_only_page(&page, None).2.scanned_text_layer);
+        page.scanned_text_layer = true;
+        let conf = text_only_page(&page, None).2;
+        assert!(conf.scanned_text_layer);
+        assert_eq!(conf.parse_score, Some(1.0));
+    }
+
+    /// Discarding the layer for OCR clears the flag with the cells.
+    #[test]
+    fn discarding_the_layer_clears_the_flag() {
+        let cell = TextCell {
+            text: "Recognised words".into(),
+            l: 72.0,
+            t: 100.0,
+            r: 300.0,
+            b: 114.0,
+        };
+        let mut page = PdfPage::from_cells(612.0, 792.0, 1.0, vec![cell]);
+        page.scanned_text_layer = true;
+        discard_text_layer(&mut page);
+        assert!(page.cells.is_empty() && !page.scanned_text_layer);
     }
 }

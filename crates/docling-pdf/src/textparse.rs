@@ -1609,6 +1609,9 @@ pub struct PageParserCells {
     pub bitmaps: Vec<[f32; 4]>,
     /// The page's shapes for the reading-order separators (#1092).
     pub shapes: PageShapes,
+    /// The text layer is a scan's — see
+    /// [`crate::pdfium_backend::PdfPage::scanned_text_layer`].
+    pub scanned_text_layer: bool,
 }
 
 /// The parser text layer, driven one page at a time: the document is loaded
@@ -1771,7 +1774,7 @@ impl PageTextParser {
             return PageParserCells::default();
         };
         let (_w, h) = page_size(&self.doc, pid);
-        let (glyphs, inks, bitmaps, shapes) =
+        let (glyphs, inks, bitmaps, shapes, scanned_text_layer) =
             page_glyphs_and_inks(&self.doc, pid, &mut self.caches);
         let (prose, words) =
             crate::dp_lines::line_and_word_cells_with(&glyphs, h, true, self.word_gap);
@@ -1782,6 +1785,7 @@ impl PageTextParser {
             checkboxes: crate::checkbox::find(&inks, h),
             bitmaps,
             shapes,
+            scanned_text_layer,
         }
     }
 
@@ -1796,7 +1800,7 @@ impl PageTextParser {
     /// document's cells. A blank page (no cells) for an index the page tree
     /// doesn't have.
     pub fn text_page(&mut self, index: usize) -> crate::pdfium_backend::PdfPage {
-        let (w, h, (glyphs, inks, _, shapes)) = match self.pages.get(index) {
+        let (w, h, (glyphs, inks, _, shapes, scanned_text_layer)) = match self.pages.get(index) {
             Some(&pid) => {
                 let (w, h) = page_size(&self.doc, pid);
                 (w, h, page_glyphs_and_inks(&self.doc, pid, &mut self.caches))
@@ -1825,6 +1829,7 @@ impl PageTextParser {
             links: Vec::new(),
             rotation: 0,
             keep_typography: self.keep_typography,
+            scanned_text_layer,
             #[cfg(feature = "render")]
             embedded_images: Vec::new(),
             #[cfg(feature = "render")]
@@ -2070,8 +2075,9 @@ fn page_glyphs_cached(
 /// [`page_glyphs_cached`] plus the small painted path pieces the same walk
 /// passed — what [`crate::checkbox::find`] looks for checkbox squares in
 /// (#609) — the page's image placements (#999, `[l, t, r, b]` top-left
-/// page points clipped to the page, the cells' frame), and its shapes for the
-/// reading-order separators (#1092, [`PageShapes`]).
+/// page points clipped to the page, the cells' frame), its shapes for the
+/// reading-order separators (#1092, [`PageShapes`]), and whether its text
+/// layer is a scan's ([`scanned_text_layer`]).
 fn page_glyphs_and_inks(
     doc: &Document,
     page_id: lopdf::ObjectId,
@@ -2081,6 +2087,7 @@ fn page_glyphs_and_inks(
     Vec<crate::checkbox::Ink>,
     Vec<[f32; 4]>,
     PageShapes,
+    bool,
 ) {
     let mut out = Vec::new();
     let mut inks = Vec::new();
@@ -2088,10 +2095,11 @@ fn page_glyphs_and_inks(
     // (an empty Vec when the page has none).
     let content_bytes = doc.get_page_content(page_id);
     let Ok(content) = lopdf::content::Content::decode(&content_bytes) else {
-        return (out, inks, Vec::new(), PageShapes::default());
+        return (out, inks, Vec::new(), PageShapes::default(), false);
     };
     let mut bitmaps = Vec::new();
     let mut page_shapes = PageShapes::default();
+    let mut scanned = false;
     if let Some(res) = page_res(doc, page_id) {
         // pdfium's page matrix: user space translated so the display box's
         // lower-left corner is the origin (see [`PageBox`]).
@@ -2115,12 +2123,14 @@ fn page_glyphs_and_inks(
             ShapeGs::INIT,
             &mut shapes,
         );
+        // Before the filters below: `covers` counts the glyphs as drawn.
+        scanned = scanned_text_layer(&out, &inks, pb.w, pb.h);
         out.retain(|g| on_page(g, pb.w, pb.h));
         drop_overprinted_spaces(&mut out);
         drop_shadow_runs(&mut out);
         let (w, h) = (f64::from(pb.w), f64::from(pb.h));
         inks.retain(|ink| match *ink {
-            crate::checkbox::Ink::Bitmap { l, b, r, t } => {
+            crate::checkbox::Ink::Bitmap { l, b, r, t, .. } => {
                 let (l, r, b, t) = (l.max(0.0), r.min(w), b.max(0.0), t.min(h));
                 if r > l && t > b {
                     bitmaps.push([l as f32, (h - t) as f32, r as f32, (h - b) as f32]);
@@ -2144,7 +2154,7 @@ fn page_glyphs_and_inks(
             );
         }
     }
-    (out, inks, bitmaps, page_shapes)
+    (out, inks, bitmaps, page_shapes, scanned)
 }
 
 /// A page's shapes for the reading-order separators (#1092), in the cells'
@@ -2799,6 +2809,7 @@ fn run_content(
                 // A pending `W` takes effect after the painting operator.
                 if std::mem::take(&mut clip_pending) {
                     capture_clip(&shape_path, &mut shape_gs.clips);
+                    shape_gs.image_clips.extend(clip_extent(&shape_path));
                 }
                 shape_path.clear();
             }
@@ -2806,6 +2817,7 @@ fn run_content(
                 path.clear();
                 if std::mem::take(&mut clip_pending) {
                     capture_clip(&shape_path, &mut shape_gs.clips);
+                    shape_gs.image_clips.extend(clip_extent(&shape_path));
                 }
                 shape_path.clear();
             }
@@ -2828,6 +2840,19 @@ fn run_content(
                     }
                     if let Some(a) = get(b"ca") {
                         shape_gs.fill_alpha = a;
+                    }
+                    if let Ok(bm) = params.get(b"BM") {
+                        let bm = match bm {
+                            Object::Array(modes) => modes.first(),
+                            mode => Some(mode),
+                        };
+                        shape_gs.blends = bm
+                            .and_then(|o| o.as_name().ok())
+                            .is_some_and(|n| n != b"Normal" && n != b"Compatible");
+                    }
+                    if let Ok(mask) = params.get(b"SMask") {
+                        shape_gs.soft_mask =
+                            !matches!(mask, Object::Name(n) if n.as_slice() == b"None");
                     }
                 }
             }
@@ -2878,7 +2903,19 @@ fn run_content(
                 }
             }
             // An inline image: the unit square under the CTM (#999).
-            "BI" => inks.push(image_ink(ctm)),
+            "BI" => {
+                // A stencil (`IM`) does not cover what is under it. lopdf
+                // hands no dictionary for an image it cannot read (an
+                // abbreviated colour space such as `/CS /G`); such an image
+                // counts as the opaque picture inline images nearly always are.
+                let masked = matches!(
+                    operands.first(),
+                    Some(Object::Stream(st)) if [b"IM".as_slice(), b"ImageMask"]
+                        .iter()
+                        .any(|k| matches!(st.dict.get(k), Ok(Object::Boolean(true))))
+                );
+                inks.push(image_ink(ctm, &shape_gs, masked, out.len()));
+            }
             "Do" => {
                 // Invoke a Form XObject: bulk body text in many PDFs lives inside
                 // a form, reached only here. An image XObject carries no text,
@@ -2912,7 +2949,13 @@ fn run_content(
                         .and_then(|o| o.as_name().ok())
                         == Some(b"Image".as_slice());
                     if is_image {
-                        inks.push(image_ink(ctm));
+                        // A soft mask, a colour-key mask or a stencil lets
+                        // what is under the image show through.
+                        let masked = [b"SMask".as_slice(), b"Mask"]
+                            .iter()
+                            .any(|k| stream.dict.has(k))
+                            || matches!(stream.dict.get(b"ImageMask"), Ok(Object::Boolean(true)));
+                        inks.push(image_ink(ctm, &shape_gs, masked, out.len()));
                     }
                     continue;
                 }
@@ -2995,14 +3038,18 @@ fn run_content(
         if matches!(tr, 3 | 7) {
             for g in &mut out[shown..] {
                 g.invisible = true;
+                g.clip_only = tr == 7;
             }
         }
     }
 }
 
 /// An image placement's box — the unit square under `ctm`, y-up page
-/// points — as an [`Ink::Bitmap`](crate::checkbox::Ink::Bitmap).
-fn image_ink(ctm: Mat) -> crate::checkbox::Ink {
+/// points — as an [`Ink::Bitmap`](crate::checkbox::Ink::Bitmap): with the
+/// part the clipping path of `gs` lets through, and, when it paints opaquely
+/// (not `masked`, full alpha, no blend mode or soft mask), the `glyphs` drawn
+/// before it.
+fn image_ink(ctm: Mat, gs: &ShapeGs, masked: bool, glyphs: usize) -> crate::checkbox::Ink {
     let pts = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| ctm.apply(x, y));
     let (mut l, mut b, mut r, mut t) = (
         f64::INFINITY,
@@ -3013,7 +3060,84 @@ fn image_ink(ctm: Mat) -> crate::checkbox::Ink {
     for (x, y) in pts {
         (l, b, r, t) = (l.min(x), b.min(y), r.max(x), t.max(y));
     }
-    crate::checkbox::Ink::Bitmap { l, b, r, t }
+    let opaque = !masked && gs.fill_alpha >= 1.0 && !gs.blends && !gs.soft_mask;
+    crate::checkbox::Ink::Bitmap {
+        l,
+        b,
+        r,
+        t,
+        shown: clipped([l, b, r, t], &gs.image_clips),
+        place: [ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f],
+        covers: opaque.then_some(glyphs),
+    }
+}
+
+/// The share of a page's glyphs that must lie hidden by an image for its
+/// text layer to be a scan's.
+const SCAN_LAYER_SHARE: f64 = 0.9;
+
+/// Whether the page's text layer is a scan's — what an OCR tool adds to a
+/// page image: at least [`SCAN_LAYER_SHARE`] of the page's non-blank glyphs
+/// lie hidden by an image, either drawn invisibly (`Tr` 3; never `Tr` 7, clip-only text) where an
+/// image shows, or drawn before an opaque image that paints over the spot.
+/// A glyph's spot is the centre of its box; all images of the page count
+/// together (a scan in strips or tiles, a scan with a margin), each with
+/// the part its clipping path lets through. Visible text on a background
+/// image, text beside a picture and a page without text are not. `glyphs`
+/// as the walk emitted them (the order `covers` counts in), the page
+/// `w` × `h` points.
+fn scanned_text_layer(glyphs: &[Glyph], inks: &[crate::checkbox::Ink], w: f32, h: f32) -> bool {
+    let images: Vec<([f64; 4], [f64; 6], Option<usize>)> = inks
+        .iter()
+        .filter_map(|ink| match *ink {
+            crate::checkbox::Ink::Bitmap {
+                shown: Some(shown),
+                place,
+                covers,
+                ..
+            } => Some((shown, place, covers)),
+            _ => None,
+        })
+        .collect();
+    let (mut text, mut hidden) = (0usize, 0usize);
+    for (i, g) in glyphs.iter().enumerate() {
+        if g.ch.is_whitespace() || !on_page(g, w, h) {
+            continue;
+        }
+        text += 1;
+        let (l, b, r, t) = if [g.ll, g.lb, g.lr, g.lt].iter().all(|v| v.is_finite()) {
+            (g.ll, g.lb, g.lr, g.lt)
+        } else {
+            (g.l, g.b, g.r, g.t)
+        };
+        let (x, y) = (f64::from(l + r) / 2.0, f64::from(b + t) / 2.0);
+        // Inside the shown part of the image, and inside the image itself:
+        // the unit square its matrix places, which a turned or skewed image
+        // fills only partly.
+        let under = |[il, ib, ir, it]: [f64; 4], [a, b, c, d, e, f]: [f64; 6]| {
+            let det = a * d - b * c;
+            let (u, v) = (
+                (d * (x - e) - c * (y - f)) / det,
+                (a * (y - f) - b * (x - e)) / det,
+            );
+            x >= il
+                && x <= ir
+                && y >= ib
+                && y <= it
+                && (0.0..=1.0).contains(&u)
+                && (0.0..=1.0).contains(&v)
+        };
+        // A clip-only glyph (`Tr` 7) is neither: what is painted through it
+        // afterwards shows in its shape.
+        if !g.clip_only
+            && images.iter().any(|&(shown, place, covers)| {
+                under(shown, place) && (g.invisible || covers.is_some_and(|after| i < after))
+            })
+        {
+            hidden += 1;
+        }
+    }
+    text > 0 && hidden as f64 >= SCAN_LAYER_SHARE * text as f64
 }
 
 /// The page's vector shapes as docling-parse's page decoder reports them to
@@ -3088,6 +3212,15 @@ struct ShapeGs {
     fill_alpha: f64,
     fill_pattern: bool,
     clips: Vec<[f64; 4]>,
+    /// A blend mode other than `Normal`/`Compatible` (`BM`): what is painted
+    /// mixes with what is under it instead of covering it.
+    blends: bool,
+    /// A soft mask (`SMask` other than `/None`) shapes what is painted.
+    soft_mask: bool,
+    /// Each clipping path as the box around all its subpaths: where an
+    /// image can show. `clips` has a box per subpath instead (docling-parse's
+    /// reading), which loses a clip of two halves or one with a hole.
+    image_clips: Vec<[f64; 4]>,
 }
 
 impl ShapeGs {
@@ -3097,6 +3230,9 @@ impl ShapeGs {
         fill_alpha: 1.0,
         fill_pattern: false,
         clips: Vec::new(),
+        blends: false,
+        soft_mask: false,
+        image_clips: Vec::new(),
     };
 }
 
@@ -3168,6 +3304,23 @@ fn capture_clip(subs: &[ShapeSub], clips: &mut Vec<[f64; 4]>) {
             clips.push([l, b, r, t]);
         }
     }
+}
+
+/// The box around every subpath of a clipping path with a segment (see
+/// [`capture_clip`]).
+fn clip_extent(subs: &[ShapeSub]) -> Option<[f64; 4]> {
+    subs.iter()
+        .filter(|s| s.pts.len() >= 2)
+        .filter_map(|s| bbox_of(&s.pts))
+        .map(|(l, b, r, t)| [l, b, r, t])
+        .reduce(|a, c| {
+            [
+                a[0].min(c[0]),
+                a[1].min(c[1]),
+                a[2].max(c[2]),
+                a[3].max(c[3]),
+            ]
+        })
 }
 
 /// docling-parse's `register_paths` for the reading-order geometry: a painted
@@ -3438,6 +3591,7 @@ fn show_text(
                     pen,
                     math_font: font.math,
                     invisible: false,
+                    clip_only: false,
                 });
             }
         }
@@ -5863,6 +6017,7 @@ mod base14_fonts {
             pen: Some([pen, 0.0, 10.0]),
             math_font: false,
             invisible: false,
+            clip_only: false,
         };
         let mut out = vec![
             glyph('o', 0.0, 0.0),
@@ -6299,5 +6454,310 @@ mod cid_collections {
             super::codes(&font, &[0xd8, 0x42, 0xdf, 0xb7]),
             vec![0xd842, 0xdfb7]
         );
+    }
+}
+
+#[cfg(test)]
+mod scanned_layer {
+    use super::*;
+    use lopdf::dictionary;
+
+    /// One 612 × 792 page with `content`, font `/F1` (Helvetica), an image
+    /// `/Im0` (1 × 1 gray, with a soft mask when `smask`) and the graphics
+    /// states `/GS0` (half fill alpha), `/GSM` and `/GSB` (blend mode
+    /// `Multiply`, `Normal`), `/GSS` and `/GSN` (a soft mask, `/None`).
+    fn pdf(content: &str, smask: bool) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let gray = || {
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            }
+        };
+        let mut image = gray();
+        if smask {
+            let mask = doc.add_object(lopdf::Stream::new(gray(), vec![128]));
+            image.set("SMask", Object::Reference(mask));
+        }
+        let image_id = doc.add_object(lopdf::Stream::new(image, vec![200]));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+            "ExtGState" => dictionary! {
+                "GS0" => dictionary! { "ca" => 0.5 },
+                "GSM" => dictionary! { "BM" => "Multiply" },
+                "GSB" => dictionary! { "BM" => "Normal" },
+                "GSS" => dictionary! { "SMask" => dictionary! { "S" => "Luminosity" } },
+                "GSN" => dictionary! { "SMask" => "None" },
+            },
+        });
+        let content_id = doc.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Reference(resources_id),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let mut out = Vec::new();
+        doc.save_to(&mut out).expect("save synthetic PDF");
+        out
+    }
+
+    /// `/Im0` placed at `l b` with size `w × h`.
+    fn image(l: u32, b: u32, w: u32, h: u32) -> String {
+        format!("q {w} 0 0 {h} {l} {b} cm /Im0 Do Q\n")
+    }
+
+    /// One line of 29 glyphs at `y`, invisible (`Tr 3`) or not. `Tr` outlives
+    /// `ET` (text state): every line sets its mode itself.
+    fn line(invisible: bool, y: u32) -> String {
+        let mode = if invisible { 3 } else { 0 };
+        format!("BT {mode} Tr /F1 12 Tf 72 {y} Td (Recognised words on the page) Tj ET\n")
+    }
+
+    /// `invisible` and then `visible` lines, from the top of the page down.
+    fn lines(invisible: u32, visible: u32) -> String {
+        (0..invisible + visible)
+            .map(|i| line(i < invisible, 700 - 20 * i))
+            .collect()
+    }
+
+    const INLINE: &str =
+        "q 612 0 0 792 0 0 cm BI /W 2 /H 2 /CS /G /BPC 8 /F /AHx ID e1e1e1e1> EI Q\n";
+    const INLINE_STENCIL: &str = "q 612 0 0 792 0 0 cm BI /W 8 /H 2 /IM true /BPC 1 ID AB EI Q\n";
+
+    fn scanned(content: &str, smask: bool) -> bool {
+        let bytes = pdf(content, smask);
+        let mut parser = PageTextParser::open(&bytes).expect("parser");
+        let walked = parser.cells(0).scanned_text_layer;
+        // The text-layer-only path reads the same.
+        assert_eq!(parser.text_page(0).scanned_text_layer, walked, "{content}");
+        walked
+    }
+
+    /// An OCR layer over a scan, and one hidden under it, are a scan's text
+    /// layer, whether the scan is one image, has a margin, comes in strips
+    /// or tiles, or is an inline image; a digital page's text is not — on a
+    /// background image, beside a picture, under a picture that is clipped,
+    /// transparent, blended or a stencil — nor is a page without text.
+    #[test]
+    fn a_scans_text_layer_is_told_from_a_digital_one() {
+        let page = image(0, 0, 612, 792);
+        let text = lines(0, 6);
+        let layer = lines(6, 0);
+        // Over: invisible text on the page image, however it is laid out.
+        assert!(scanned(&format!("{page}{layer}"), false));
+        assert!(scanned(
+            &format!("{}{layer}", image(30, 40, 552, 712)),
+            false
+        ));
+        let strips = image(0, 396, 612, 396) + &image(0, 0, 612, 396);
+        assert!(scanned(&format!("{strips}{layer}"), false));
+        let tiles = image(0, 396, 306, 396)
+            + &image(306, 396, 306, 396)
+            + &image(0, 0, 306, 396)
+            + &image(306, 0, 306, 396);
+        assert!(scanned(&format!("{tiles}{layer}"), false));
+        assert!(scanned(&format!("{INLINE}{layer}"), false));
+        // Under: text an opaque image is drawn over, visible or not.
+        assert!(scanned(&format!("{text}{page}"), false));
+        assert!(scanned(&format!("{layer}{page}"), false));
+        assert!(scanned(&format!("q {text}Q {page}"), false));
+        assert!(scanned(&format!("{text}{INLINE}"), false));
+        // Digital: visible text on a background image, no image, a logo
+        // beside invisible text, a picture under the heading but not on it.
+        assert!(!scanned(&format!("{page}{text}"), false));
+        assert!(!scanned(&text, false));
+        assert!(!scanned(&layer, false));
+        assert!(!scanned(
+            &format!("{}{layer}", image(40, 740, 120, 40)),
+            false
+        ));
+        let heading = line(false, 775) + &line(false, 760);
+        assert!(!scanned(
+            &format!("{heading}{}", image(0, 0, 612, 716)),
+            false
+        ));
+        // A picture over the text that does not cover it: clipped to a
+        // corner, with a soft mask, at half alpha, blended, a stencil.
+        let clipped = format!("q 200 100 200 150 re W n {page}Q");
+        assert!(!scanned(&format!("{text}{clipped}"), false));
+        assert!(!scanned(&format!("{text}{page}"), true));
+        assert!(!scanned(&format!("{text}q /GS0 gs {page}Q"), false));
+        assert!(!scanned(&format!("{text}q /GSM gs {page}Q"), false));
+        assert!(!scanned(&format!("{text}{INLINE_STENCIL}"), false));
+        // An image-only page has no text layer at all.
+        assert!(!scanned(&page, false));
+    }
+
+    /// At least nine in ten glyphs must be hidden: a scan with a visible
+    /// stamp line among nine layer lines is one, with two among eight not.
+    #[test]
+    fn nine_in_ten_glyphs_must_be_hidden() {
+        let page = image(0, 0, 612, 792);
+        assert!(scanned(&format!("{page}{}", lines(9, 1)), false));
+        assert!(!scanned(&format!("{page}{}", lines(8, 2)), false));
+        assert!(scanned(
+            &format!("{}{page}{}", lines(0, 9), lines(0, 1)),
+            false
+        ));
+        assert!(!scanned(
+            &format!("{}{page}{}", lines(0, 8), lines(0, 2)),
+            false
+        ));
+    }
+
+    /// Where an image really is and what really hides: a turned image by
+    /// its own shape, not its bounding box; a clip of several parts by the
+    /// box around them; `Tr 7` text (a clipping path) is not hidden; a soft
+    /// mask from the graphics state shows what is under it, `/SMask /None`
+    /// and blend mode `Normal` do not; a glyph counts by its centre, not a
+    /// corner; spaces do not count.
+    #[test]
+    fn what_hides_a_glyph_and_where() {
+        let page = image(0, 0, 612, 792);
+        let text = lines(0, 6);
+        let layer = lines(6, 0);
+        // A line in the corner, then a diamond (a square turned 45°) whose
+        // bounding box holds the line but whose area does not.
+        let corner = "BT 0 Tr /F1 12 Tf 60 740 Td (Recognised words on the page) Tj ET\n";
+        let diamond = "q 300 300 -300 300 306 150 cm /Im0 Do Q\n";
+        assert!(!scanned(&format!("{corner}{diamond}"), false));
+        let turned = "q 0 792 -612 0 612 0 cm /Im0 Do Q\n";
+        assert!(scanned(&format!("{turned}{layer}"), false));
+        // Clipped to the two halves of the page, or to the page with a hole.
+        let halves = format!("q 0 0 306 792 re 306 0 306 792 re W n {page}Q\n");
+        assert!(scanned(&format!("{halves}{layer}"), false));
+        let hole = format!("q 0 0 612 792 re 100 100 200 200 re W* n {page}Q\n");
+        assert!(scanned(&format!("{hole}{layer}"), false));
+        // Clip-only text over the page image.
+        let clip_text: String = (0..6)
+            .map(|i| {
+                let y = 700 - 20 * i;
+                format!("BT 7 Tr /F1 12 Tf 72 {y} Td (Recognised words on the page) Tj ET\n")
+            })
+            .collect();
+        assert!(!scanned(&format!("{page}{clip_text}"), false));
+        // A heading as a clipping path, the page image painted through it.
+        let headline = format!(
+            "q BT 7 Tr /F1 60 Tf 60 400 Td (HEADLINE) Tj ET {page}Q
+"
+        );
+        assert!(!scanned(&headline, false));
+        // Graphics-state soft mask, `/SMask /None`, blend mode `Normal`.
+        assert!(!scanned(&format!("{text}q /GSS gs {page}Q"), false));
+        assert!(scanned(&format!("{text}q /GSN gs {page}Q"), false));
+        assert!(scanned(&format!("{text}q /GSB gs {page}Q"), false));
+        // An image covering the bottom of a line (baseline 600), or its top:
+        // corners of every glyph under it, centres not.
+        let base = line(false, 600);
+        assert!(!scanned(
+            &format!("{base}q 612 0 0 599 0 0 cm /Im0 Do Q\n"),
+            false
+        ));
+        assert!(!scanned(
+            &format!("{base}q 612 0 0 200 0 606.5 cm /Im0 Do Q\n"),
+            false
+        ));
+        // A visible line of one letter and 40 spaces beside nine layer lines.
+        let spaces = format!("BT 0 Tr /F1 12 Tf 72 500 Td (x{}) Tj ET\n", " ".repeat(40));
+        assert!(scanned(&format!("{page}{}{spaces}", lines(9, 0)), false));
+    }
+
+    /// #999's fixture — a scan with one typed-in native word on it — has no
+    /// OCR layer: its one word is the form's value, drawn on top.
+    #[test]
+    fn a_typed_value_on_a_scan_is_not_its_ocr_layer() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../docling/tests/fixtures/partial_text_layer/scan_with_native_word.pdf");
+        let bytes = std::fs::read(path).expect("fixture");
+        let mut parser = PageTextParser::open(&bytes).expect("parser");
+        assert!(!parser.cells(0).scanned_text_layer);
+    }
+
+    /// The flag reaches the page the walk hands out and the conversion's
+    /// report, on the text-layer path (no model needed).
+    #[cfg(feature = "ml")]
+    #[test]
+    fn the_report_carries_the_flag_on_the_text_layer_path() {
+        let report = |content: &str| {
+            let doc = crate::Pipeline::new()
+                .unwrap()
+                .no_ocr(true)
+                .convert(&pdf(content, false), None, "scan.pdf")
+                .unwrap();
+            doc.confidence.unwrap().pages[&1].scanned_text_layer
+        };
+        let page = image(0, 0, 612, 792);
+        assert!(report(&format!("{page}{}", lines(6, 0))));
+        assert!(!report(&format!("{page}{}", lines(0, 6))));
+        let mut walked = Vec::new();
+        crate::pdfium_backend::for_each_page::<crate::PdfError, _>(
+            &pdf(&format!("{page}{}", lines(6, 0)), false),
+            None,
+            false,
+            true,
+            None,
+            |_, _, p| {
+                walked.push(p.scanned_text_layer);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(walked, [true]);
+    }
+
+    /// The full pipeline (layout and OCR models): the flag reaches the report
+    /// through `complete_page`, and is cleared when force-OCR discards the
+    /// layer. Skipped when the models are not installed.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn the_report_carries_the_flag_on_the_model_path() {
+        let bytes = pdf(&format!("{}{}", image(0, 0, 612, 792), lines(6, 0)), false);
+        let flag = |force: bool| match crate::Pipeline::new()
+            .unwrap()
+            .force_full_page_ocr(force)
+            .convert(&bytes, None, "scan.pdf")
+        {
+            Ok(doc) => Some(doc.confidence.unwrap().pages[&1].scanned_text_layer),
+            Err(e @ (crate::PdfError::Layout(_) | crate::PdfError::Ocr(_))) => {
+                eprintln!("skipping: {e}");
+                None
+            }
+            Err(e) => panic!("{e}"),
+        };
+        if let Some(kept) = flag(false) {
+            assert!(kept, "the layer kept: a scan's");
+        }
+        if let Some(discarded) = flag(true) {
+            assert!(!discarded, "the layer discarded: the page's text is OCR's");
+        }
     }
 }

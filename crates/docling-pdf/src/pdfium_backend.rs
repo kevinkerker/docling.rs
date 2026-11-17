@@ -117,6 +117,14 @@ pub struct PdfPage {
     /// `…`, `⁄`, `•` — instead of folding it to ASCII the way docling-parse's
     /// sanitizer does (`pdf_keep_typography`, #921). Read by assembly.
     pub keep_typography: bool,
+    /// The page's text layer is a scan's — an earlier OCR's text: nine in
+    /// ten of its glyphs invisible over or hidden under the page's images —
+    /// rather than a
+    /// digital page's text (`textparse::scanned_text_layer`). The ML
+    /// pipeline reports it as
+    /// [`PageConfidence::scanned_text_layer`](docling_core::confidence::PageConfidence::scanned_text_layer).
+    /// `false` without a PDF text layer (images, METS, OCR'd pages).
+    pub scanned_text_layer: bool,
     /// The page's image placements (#1007, docling's
     /// `use_embedded_picture_images`): a picture region matching exactly one
     /// safe image gets that bitmap at native resolution instead of a render
@@ -153,6 +161,7 @@ impl PdfPage {
             links: Vec::new(),
             rotation: 0,
             keep_typography: false,
+            scanned_text_layer: false,
             #[cfg(feature = "render")]
             embedded_images: Vec::new(),
         }
@@ -1201,6 +1210,7 @@ fn extract_page(
     let mut checkboxes = rc.checkboxes;
     let mut bitmaps = rc.bitmaps;
     let mut shapes = rc.shapes;
+    let scanned_text_layer = rc.scanned_text_layer;
     if rotation != 0 {
         for c in cells
             .iter_mut()
@@ -1409,6 +1419,7 @@ fn extract_page(
         links,
         rotation: 0,
         keep_typography: false,
+        scanned_text_layer,
         #[cfg(feature = "render")]
         embedded_images: Vec::new(),
     };
@@ -1516,8 +1527,11 @@ pub(crate) struct Glyph {
     /// its base is attached, not a new word (#921).
     pub(crate) math_font: bool,
     /// Drawn in an invisible text rendering mode (`Tr` 3 or 7) — an OCR
-    /// layer over a scan. Only the script-position stage reads it (#1005).
+    /// layer over a scan. Read by the script-position stage (#1005).
     pub(crate) invisible: bool,
+    /// Drawn in `Tr` 7 (clip only): the glyphs are a clipping path, what is
+    /// painted through them shows. Not an OCR layer for the scan verdict.
+    pub(crate) clip_only: bool,
 }
 
 impl Glyph {

@@ -6200,6 +6200,7 @@ mod tests {
             ],
             rotation: 0,
             keep_typography: false,
+            scanned_text_layer: false,
             #[cfg(feature = "render")]
             embedded_images: Vec::new(),
             #[cfg(feature = "ml")]

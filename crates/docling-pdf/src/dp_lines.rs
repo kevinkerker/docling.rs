@@ -1459,6 +1459,7 @@ mod tests {
             pen: None,
             math_font: false,
             invisible: false,
+            clip_only: false,
         }
     }
 
@@ -1555,6 +1556,7 @@ mod tests {
             pen: None,
             math_font: false,
             invisible: false,
+            clip_only: false,
         };
         let mut g = Vec::new();
         let mut run = |text: &str, edges: &[f32], font: u64| {

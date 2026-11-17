@@ -45,7 +45,20 @@ pub(crate) enum Ink {
     Blot { l: f64, b: f64, r: f64, t: f64 },
     /// An image placement (#999): the text parser hands these on as the
     /// page's bitmaps and drops them before [`find`] sees the inks.
-    Bitmap { l: f64, b: f64, r: f64, t: f64 },
+    /// `shown`: the part of it the clipping path lets through (`None`:
+    /// clipped away). `covers`: for an opaque image, the number of glyphs
+    /// drawn before it — the ones it paints over where it lies on them.
+    Bitmap {
+        l: f64,
+        b: f64,
+        r: f64,
+        t: f64,
+        shown: Option<[f64; 4]>,
+        /// The placement matrix `[a b c d e f]`: the image is the unit
+        /// square under it, a parallelogram when turned or skewed.
+        place: [f64; 6],
+        covers: Option<usize>,
+    },
 }
 
 /// Smallest and largest checkbox side, points: below 5 pt a square is a
@@ -59,9 +72,9 @@ impl Ink {
     fn bbox(&self) -> (f64, f64, f64, f64) {
         match *self {
             Ink::Seg { x0, y0, x1, y1 } => (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)),
-            Ink::Rect { l, b, r, t } | Ink::Blot { l, b, r, t } | Ink::Bitmap { l, b, r, t } => {
-                (l, b, r, t)
-            }
+            Ink::Rect { l, b, r, t }
+            | Ink::Blot { l, b, r, t }
+            | Ink::Bitmap { l, b, r, t, .. } => (l, b, r, t),
         }
     }
 

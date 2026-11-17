@@ -302,6 +302,7 @@ pub fn page_confidence(
         layout_score: layout_score(regions, ocr),
         table_score: None,
         ocr_score: ocr,
+        scanned_text_layer: false,
     }
 }
 
