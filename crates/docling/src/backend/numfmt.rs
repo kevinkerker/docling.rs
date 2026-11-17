@@ -18,6 +18,15 @@
 //! currency words, plain `#,##0` and `00000` — stays `str(value)`, as it did,
 //! so nothing reads worse than before. Formulas keep their cached results.
 //!
+//! Beyond the PR, a numeric format with neither `$` nor `%` that the PR
+//! leaves raw is rendered by [`format_plain_number`]: digit placeholders
+//! (`0`, `#`, `?`), thousands grouping, fixed and optional decimals, scaling
+//! commas, literal text and currency symbols (`"€"`, `\ `, `[$€-407]`,
+//! `"EUR"`), the negative and zero sections — in the same US spelling as
+//! the PR (`.` decimal point, `,` thousands separator), whatever the
+//! workbook's or the system's locale. Fractions, scientific notation,
+//! conditions, text sections and literal digits still stay `str(value)`.
+//!
 //! The format codes come from the workbook itself: `xl/styles.xml`
 //! (`numFmts` + `cellXfs`, [`xlsx_xf_formats`]) and each sheet's `c/@s`
 //! style indexes ([`xlsx_cell_styles`]); for `.xls`, the Workbook stream's
@@ -31,7 +40,8 @@ use std::collections::HashMap;
 use calamine::Data;
 
 /// openpyxl's `BUILTIN_FORMATS` (`openpyxl.styles.numbers`) — the codes an
-/// `xf` without a custom `numFmt` means. Ids 5–8 and 41–44 are what the US
+/// `xf` without a custom `numFmt` means, except ids 37–40 (negatives with a
+/// minus, see there). Ids 5–8 and 41–44 are what the US
 /// build of Excel writes; a workbook may redefine them in its own `numFmts`
 /// / `FORMAT` records, which take precedence.
 pub(crate) fn builtin_format(id: u32) -> Option<&'static str> {
@@ -59,10 +69,16 @@ pub(crate) fn builtin_format(id: u32) -> Option<&'static str> {
         20 => "h:mm",
         21 => "h:mm:ss",
         22 => "m/d/yy h:mm",
-        37 => "#,##0_);(#,##0)",
-        38 => "#,##0_);[Red](#,##0)",
-        39 => "#,##0.00_);(#,##0.00)",
-        40 => "#,##0.00_);[Red](#,##0.00)",
+        // openpyxl has US Excel's `#,##0_);(#,##0)` &c. here, negatives in
+        // parentheses. A German Excel stores its "thousands separator,
+        // negatives with a minus" formats (`#,##0;-#,##0`, red or not) under
+        // these same ids without writing the code, and the file does not say
+        // which one it means: the minus reads as negative either way, a
+        // parenthesis may not. A code the workbook spells out is kept as is.
+        37 => "#,##0;-#,##0",
+        38 => "#,##0;[Red]-#,##0",
+        39 => "#,##0.00;-#,##0.00",
+        40 => "#,##0.00;[Red]-#,##0.00",
         41 => r#"_(* #,##0_);_(* \(#,##0\);_(* "-"_);_(@_)"#,
         42 => r#"_("$"* #,##0_);_("$"* \(#,##0\);_("$"* "-"_);_(@_)"#,
         43 => r#"_(* #,##0.00_);_(* \(#,##0.00\);_(* "-"??_);_(@_)"#,
@@ -563,7 +579,7 @@ pub(crate) fn format_value(value: CellValue, fmt: &str) -> Option<String> {
             if is_date_format(fmt) {
                 return None;
             }
-            format_number(f, fmt)
+            format_number(f, fmt).or_else(|| format_plain_number(f, fmt))
         }
         CellValue::Duration(_) => None,
         CellValue::DateTime(..) | CellValue::Time(..) => format_date(value, fmt),
@@ -681,7 +697,8 @@ fn format_number(value: f64, fmt: &str) -> Option<String> {
     }
     let rounded = amount.quantize_half_up(decimals);
     let grouping = caps[2].contains(',');
-    let sign = if value < 0.0 && section_index == 0 {
+    // Excel drops the minus of a value that rounds to zero (`-$0.00` → `$0.00`).
+    let sign = if value < 0.0 && section_index == 0 && !rounded.is_zero() {
         "-"
     } else {
         ""
@@ -765,6 +782,11 @@ impl DecimalText {
         self
     }
 
+    /// Every digit is zero (after rounding: nothing shows but zeros).
+    fn is_zero(&self) -> bool {
+        self.int.iter().chain(&self.frac).all(|&d| d == 0)
+    }
+
     /// Python's `f"{d:,.{decimals}f}"`.
     fn render(&self, grouping: bool, decimals: usize) -> String {
         let mut out = String::new();
@@ -783,6 +805,256 @@ impl DecimalText {
         }
         out
     }
+}
+
+/// One piece of a numeric format section, as [`format_plain_number`] reads it.
+#[derive(Debug, Clone, PartialEq)]
+enum NumTok {
+    /// A digit placeholder: `0` (always a digit), `#` (a significant digit
+    /// only), `?` (a space where `0` would print an insignificant zero).
+    Digit(char),
+    /// The decimal point.
+    Point,
+    /// A comma: thousands grouping between the integer placeholders, a
+    /// division by 1000 after them.
+    Comma,
+    /// Text shown as written: quoted, `\`-escaped, or a plain literal
+    /// character (a space, `-`, `(`, `€`, …).
+    Lit(String),
+    /// `@`, the cell's text: only a text section has it.
+    Text,
+}
+
+/// The sections of a numeric format as [`NumTok`]s; `None` for what
+/// [`format_plain_number`] does not render: an unterminated quote, an
+/// unquoted letter or digit (`E+` scientific, `General`, a stray date code),
+/// `/` (a fraction), `‰`, and a bracket left once colours and locales are
+/// gone (a condition, `[DBNum1]`).
+fn plain_sections(code: &str) -> Option<Vec<Vec<NumTok>>> {
+    let mut sections = vec![Vec::new()];
+    let mut chars = code.chars();
+    while let Some(c) = chars.next() {
+        let tok = match c {
+            ';' => {
+                sections.push(Vec::new());
+                continue;
+            }
+            '0' | '#' | '?' => NumTok::Digit(c),
+            '@' => NumTok::Text,
+            '.' => NumTok::Point,
+            ',' => NumTok::Comma,
+            '"' => {
+                let mut lit = String::new();
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        ch => lit.push(ch),
+                    }
+                }
+                NumTok::Lit(lit)
+            }
+            '\\' => NumTok::Lit(chars.next()?.to_string()),
+            // `_x` pads the width of `x`, `*x` repeats `x` across the cell:
+            // layout, not text (the PR drops `_x` the same way).
+            '_' | '*' => {
+                chars.next()?;
+                continue;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, '/' | '[' | ']' | '‰') => return None,
+            c => NumTok::Lit(c.to_string()),
+        };
+        sections.last_mut()?.push(tok);
+    }
+    Some(sections)
+}
+
+/// A numeric format the PR leaves raw — one with neither `$` nor `%`, which
+/// stay the PR's — rendered in the PR's US spelling (`.` decimal point, `,`
+/// thousands separator), whatever the locale. Excel's rules: the section is
+/// chosen by sign (`pos;neg;zero;text`, the negative one showing the
+/// magnitude with only its own literals); the value is rounded half-up to
+/// the decimal placeholders; `0` prints a digit always, `#` only a
+/// significant one, `?` a space instead of an insignificant zero (optional
+/// decimals keep their point: `0.##` shows 12 as `12.`); a comma between
+/// integer placeholders groups thousands, one after them divides by 1000;
+/// surplus integer digits go to the leftmost placeholder; literals stay
+/// where the format puts them (`###\ ###\ ##0` shows 73205 as `73 205`), a
+/// currency in brackets (`[$€-407]`) as its symbol, a locale alone
+/// (`[$-407]`) as nothing, colours not at all. Leading and trailing spaces
+/// — the padding an empty placeholder or `?` leaves — are trimmed.
+/// `None` (raw value) for fractions, scientific notation, conditions, text
+/// sections, `General` inside a section and literal digits.
+fn format_plain_number(value: f64, fmt: &str) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    let without_colors = cached_regex!(
+        r"(?i)\[(?:Black|Blue|Cyan|Green|Magenta|Red|White|Yellow|Color\s*\d{1,2})\]"
+    )
+    .replace_all(fmt, "");
+    let code = cached_regex!(r"\[\$([^\]\-]*)(?:-[0-9A-Fa-f]+)?\]").replace_all(
+        &without_colors,
+        |c: &regex::Captures| {
+            if c[1].is_empty() {
+                String::new()
+            } else {
+                format!("\"{}\"", &c[1])
+            }
+        },
+    );
+    if code.contains(['$', '%']) {
+        return None;
+    }
+    let sections = plain_sections(&code)?;
+    if sections.len() > 4 {
+        return None;
+    }
+    let index = if value < 0.0 && sections.len() > 1 {
+        1
+    } else if value == 0.0 && sections.len() > 2 {
+        2
+    } else {
+        0
+    };
+    let section = &sections[index];
+    let is_digit = |t: &NumTok| matches!(t, NumTok::Digit(_));
+    if section.iter().any(|t| match t {
+        NumTok::Lit(l) => l.chars().any(|c| c.is_ascii_digit()),
+        NumTok::Text => true,
+        _ => false,
+    }) {
+        return None;
+    }
+    let Some(last_digit) = section.iter().rposition(is_digit) else {
+        // A section of text alone — `"-"` for zero, or empty: shown as is.
+        let mut text = String::new();
+        for t in section {
+            match t {
+                NumTok::Lit(l) => text.push_str(l),
+                _ => return None,
+            }
+        }
+        return Some(text);
+    };
+    let points: Vec<usize> = (0..section.len())
+        .filter(|&i| section[i] == NumTok::Point)
+        .collect();
+    if points.len() > 1 {
+        return None;
+    }
+    let split = points.first().copied().unwrap_or(section.len());
+    let int_last = section[..split].iter().rposition(is_digit);
+    let (mut grouping, mut scale) = (false, 0);
+    for (i, t) in section.iter().enumerate() {
+        if *t != NumTok::Comma {
+            continue;
+        }
+        if i < split && int_last.is_some_and(|l| i < l) {
+            grouping = true;
+        } else if i < split || i > last_digit {
+            scale += 1;
+        } else {
+            return None;
+        }
+    }
+    let slots = |toks: &[NumTok]| -> Vec<char> {
+        toks.iter()
+            .filter_map(|t| match t {
+                NumTok::Digit(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    };
+    let int_slots = slots(&section[..split]);
+    let frac_slots = slots(&section[split..]);
+    let mut amount = value.abs();
+    for _ in 0..scale {
+        amount /= 1000.0;
+    }
+    let rounded = DecimalText::from_f64(amount).quantize_half_up(frac_slots.len());
+    // Integer digits without leading zeros, padded to the `0` placeholders.
+    let mut digits: Vec<u8> = rounded
+        .int
+        .iter()
+        .copied()
+        .skip_while(|&d| d == 0)
+        .collect();
+    let min = int_slots
+        .iter()
+        .position(|&c| c == '0')
+        .map_or(0, |p| int_slots.len() - p);
+    while digits.len() < min {
+        digits.insert(0, 0);
+    }
+    let n = digits.len();
+    let units: Vec<String> = digits
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let mut u = String::new();
+            if grouping && i > 0 && (n - i).is_multiple_of(3) {
+                u.push(',');
+            }
+            u.push((b'0' + d) as char);
+            u
+        })
+        .collect();
+    // Right to left over the integer placeholders; the leftmost takes the
+    // surplus digits, the ones left over print nothing (`#`) or a space (`?`).
+    let p = int_slots.len();
+    let mut int_out = vec![String::new(); p];
+    for k in 0..p {
+        let slot = p - 1 - k;
+        if k < n {
+            int_out[slot] = units[n - 1 - k].clone();
+        } else if int_slots[slot] == '?' {
+            int_out[slot] = " ".to_string();
+        }
+    }
+    if p > 0 && n > p {
+        int_out[0] = units[..n - p + 1].concat();
+    }
+    // Decimals: trailing zeros under `#` vanish, under `?` become spaces.
+    let mut frac_out: Vec<String> = rounded.frac[..frac_slots.len()]
+        .iter()
+        .map(|d| ((b'0' + d) as char).to_string())
+        .collect();
+    for k in (0..frac_slots.len()).rev() {
+        if frac_slots[k] == '0' || rounded.frac[k] != 0 {
+            break;
+        }
+        frac_out[k] = if frac_slots[k] == '?' { " " } else { "" }.to_string();
+    }
+    let mut out = String::new();
+    let (mut ii, mut fi) = (0, 0);
+    for (i, t) in section.iter().enumerate() {
+        match t {
+            NumTok::Digit(_) if i < split => {
+                out.push_str(&int_out[ii]);
+                ii += 1;
+            }
+            NumTok::Digit(_) => {
+                out.push_str(&frac_out[fi]);
+                fi += 1;
+            }
+            NumTok::Point => {
+                // No integer placeholder (`.00`): the integer digits go here.
+                if p == 0 {
+                    out.push_str(&units.concat());
+                }
+                out.push('.');
+            }
+            NumTok::Comma | NumTok::Text => {}
+            NumTok::Lit(l) => out.push_str(l),
+        }
+    }
+    let text = out.trim_matches(' ');
+    // As Excel: no minus for a value whose shown digits are all zero.
+    Some(if value < 0.0 && index == 0 && !rounded.is_zero() {
+        format!("-{text}")
+    } else {
+        text.to_string()
+    })
 }
 
 /// `_format_excel_date`: the format's tokens rendered from the value; `None`
@@ -977,8 +1249,9 @@ mod tests {
     }
 
     /// Beyond the PR's table: weekday and month names, large and tiny
-    /// amounts, the reporter's formats (#634) — `0.0%` renders, `"EUR"`,
-    /// `#,##0` and `00000` stay raw — and the serial → value typing.
+    /// amounts, the reporter's formats (#634) — `0.0%` renders, and so do
+    /// `"EUR"`, `#,##0` and `00000` since [`format_plain_number`] — and the
+    /// serial → value typing.
     #[test]
     fn further_cases_match_the_pr_run_through_openpyxl() {
         assert_eq!(
@@ -997,10 +1270,10 @@ mod tests {
         assert_eq!(fmt(t(1, 2, 3), "h:mm:ss AM/PM"), "1:02:03 AM");
         assert_eq!(fmt(dt(2024, 1, 2, 5, 6, 7), "h:mm:ss"), "5:06:07");
         assert_eq!(fmt(n(0.15), "0.0%"), "15.0%");
-        assert_eq!(fmt(n(1234.5), r#""EUR" #,##0.00"#), "1234.5");
+        assert_eq!(fmt(n(1234.5), r#""EUR" #,##0.00"#), "EUR 1,234.50");
         assert_eq!(fmt(dt(2024, 1, 31, 0, 0, 0), "dd/mm/yyyy"), "31/01/2024");
-        assert_eq!(fmt(n(1234567.891), "#,##0"), "1234567.891");
-        assert_eq!(fmt(n(42.0), "00000"), "42");
+        assert_eq!(fmt(n(1234567.891), "#,##0"), "1,234,568");
+        assert_eq!(fmt(n(42.0), "00000"), "00042");
         assert_eq!(fmt(n(12345.678), "0.00E+00"), "12345.678");
         assert_eq!(fmt(n(3.5), "@"), "3.5");
         // Serials: a fraction is a time, 1900's phantom leap day, 1904 epoch.
@@ -1030,6 +1303,165 @@ mod tests {
         assert!(!is_date_format(r"\d0"));
         assert!(!is_date_format("0.0%"));
         assert!(is_date_format(r#""Due "mmm d"#));
+    }
+
+    /// Formats the PR leaves raw — grouping, fixed and optional decimals,
+    /// currencies other than `$`, literal text, scaling, the sign sections —
+    /// rendered in US spelling; what stays raw stays raw.
+    #[test]
+    fn plain_number_formats_render_in_us_spelling() {
+        let cases: Vec<(f64, &str, &str)> = vec![
+            // Grouping and fixed decimals (built-ins 1–4 and combinations).
+            (12000.0, "#,##0", "12,000"),
+            (1234.5, "#,##0.00", "1,234.50"),
+            (648.686708086533, "0.0", "648.7"),
+            (1234.5678, "0", "1235"),
+            (0.5, "0.00", "0.50"),
+            (0.5, "#.00", ".50"),
+            (0.0, "#,##0", "0"),
+            (0.0, "#,###", ""),
+            (2.5, "0", "3"),
+            (-2.5, "0", "-3"),
+            // A negative value whose shown digits are all zero has no minus.
+            (-0.001, "0.00", "0.00"),
+            (-0.4, "0", "0"),
+            (-0.4, "#,###", ""),
+            (-0.004, r#"#,##0.00 "€""#, "0.00 €"),
+            (-0.5, "0", "-1"),
+            (-0.005, "0.00", "-0.01"),
+            (1e20, "#,##0", "100,000,000,000,000,000,000"),
+            (5.0, "0000", "0005"),
+            (5.0, "0,000", "0,005"),
+            // Optional decimals: `#` drops trailing zeros, `?` pads them.
+            (12.0, "0.##", "12."),
+            (12.345, "0.##", "12.35"),
+            (12.5, "0.0??", "12.5"),
+            (12.5, r#"0.0??" m""#, "12.5   m"),
+            (5.0, r#""n="???"#, "n=  5"),
+            (12.5, ".00", "12.50"),
+            // Euro and other currencies, before and after, with a locale.
+            (1234.5, r#"#,##0.00 "€""#, "1,234.50 €"),
+            (1234.5, "#,##0.00 [$€-407]", "1,234.50 €"),
+            (1234.5, "[$€-2] #,##0.00", "€ 1,234.50"),
+            (1234.5, "#,##0.00 €", "1,234.50 €"),
+            (1234.5, r##""€"#,##0.00"##, "€1,234.50"),
+            (-5.0, r##""€"#,##0.00"##, "-€5.00"),
+            (1234.5, "[$CHF] #,##0.00", "CHF 1,234.50"),
+            (1234.5, "[$-407]#,##0.00", "1,234.50"),
+            (-5.0, r#"#,##0.00\ "€";\-#,##0.00\ "€""#, "-5.00 €"),
+            (-5.0, r#"#,##0.00 "€";[Red]#,##0.00 "€""#, "5.00 €"),
+            // Literal characters stay where the format puts them (Destatis).
+            (73205.0, r"###\ ###\ ###\ ##0", "73 205"),
+            (345.0, r"###\ ###\ ###\ ##0", "345"),
+            (2705276.5, r"###\ ###\ ###\ ##0", "2 705 277"),
+            (0.0, r"###\ ###\ ###\ ##0", "0"),
+            (123456789.0, "000-00-0000", "123-45-6789"),
+            (5.0, r#""Stk. "0"#, "Stk. 5"),
+            (5.0, r#"0" kg""#, "5 kg"),
+            // Scaling commas.
+            (1234567.0, "#,##0,", "1,235"),
+            (1234567.0, r#"0.0,,"M""#, "1.2M"),
+            // Sign sections: negative without its own sign, zero, colours.
+            (-1500.0, "#,##0;[Red]-#,##0", "-1,500"),
+            (-1500.0, "#,##0_);(#,##0)", "(1,500)"),
+            (1500.0, "#,##0_);[Red](#,##0)", "1,500"),
+            (-1500.0, "0;0", "1500"),
+            // Zero takes the first section when there is no third.
+            (0.0, "0.0;(0.0)", "0.0"),
+            (0.0, r#"_(* #,##0_);_(* \(#,##0\);_(* "-"_);_(@_)"#, "-"),
+            (
+                -1234.0,
+                r#"_(* #,##0_);_(* \(#,##0\);_(* "-"_);_(@_)"#,
+                "(1,234)",
+            ),
+            (
+                0.0,
+                r#"_(* #,##0.00_);_(* \(#,##0.00\);_(* "-"??_);_(@_)"#,
+                "-",
+            ),
+            (0.0, "0.00;-0.00;", ""),
+            (-1500.0, "#,##0;[Color10]-#,##0", "-1,500"),
+            // Still raw: scientific, fractions, conditions, text, literal
+            // digits, `General` in a section, more than four sections.
+            (12345.678, "0.00E+00", "12345.678"),
+            (1.5, "# ?/?", "1.5"),
+            (150.0, "[>=100]0;0.0", "150"),
+            (12.25, "0.0;@", "12.3"),
+            (1234.0, "#,##0;-#,##0;0;@", "1,234"),
+            (-5.0, "0.0;@", "-5"),
+            (5.0, r#""1x"0"#, "5"),
+            (5.0, r"\1\.0#", "5"),
+            (5.0, "General;-General", "5"),
+            (5.0, "0;0;0;@;0", "5"),
+            (5.5, "0;0;0;0;0", "5.5"),
+            (1.5, "0.0.0", "1.5"),
+            (5.0, "[DBNum1]0", "5"),
+        ];
+        for (value, code, expected) in cases {
+            assert_eq!(fmt(n(value), code), expected, "{value:?} with {code:?}");
+        }
+        // Integers and formulas' cached floats go the same way; dates and
+        // `$`/`%` keep the PR's rules (`#,##0.0%` is the PR's, not ours).
+        assert_eq!(
+            displayed_text(&Data::Int(73205), Some(r"###\ ###\ ###\ ##0"), false),
+            "73 205"
+        );
+        assert_eq!(
+            displayed_text(&Data::Float(2469.0), Some("#,##0.00"), false),
+            "2,469.00"
+        );
+        assert_eq!(fmt(n(0.1234), "#,##0.0%"), "12.3%");
+        assert_eq!(fmt(n(12.5), r#""$"0.##"#), "12.5");
+        assert_eq!(fmt(n(12.5), "[$$-409]#,##0.0#"), "12.5");
+        assert_eq!(fmt(n(12.5), r##""US$"#,##0.00"##), "12.5");
+        // The PR's `$`/`%` rules drop the minus of a zero the same way.
+        assert_eq!(fmt(n(-0.001), r##""$"#,##0.00"##), "$0.00");
+        assert_eq!(fmt(n(-0.00001), "0%"), "0%");
+        assert_eq!(fmt(n(-0.006), "0.0%"), "-0.6%");
+    }
+
+    /// Built-in ids 37–40 show negatives with a minus — a German Excel saves
+    /// its minus formats under them without the code — in `.xlsx` and `.xls`
+    /// alike; a parenthesis format the workbook spells out stays one.
+    #[test]
+    fn builtin_ids_37_to_40_show_a_minus() {
+        let styles = r##"<styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0_);(#,##0)"/></numFmts><cellXfs count="5"><xf numFmtId="37"/><xf numFmtId="38"/><xf numFmtId="39"/><xf numFmtId="40"/><xf numFmtId="164"/></cellXfs></styleSheet>"##;
+        let xlsx = xlsx_xf_formats(styles);
+        // BIFF8 globals: BOF, FORMAT 164 (8-bit string), XF per id, EOF.
+        let record = |id: u16, data: &[u8]| {
+            let mut r = id.to_le_bytes().to_vec();
+            r.extend((data.len() as u16).to_le_bytes());
+            r.extend(data);
+            r
+        };
+        let code = "#,##0_);(#,##0)";
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend((code.len() as u16).to_le_bytes());
+        format.push(0);
+        format.extend(code.bytes());
+        let mut stream = record(0x0809, &[0x00, 0x06, 0x05, 0x00]);
+        stream.extend(record(0x041E, &format));
+        for id in [37u16, 38, 39, 40, 164] {
+            let mut xf = 0u16.to_le_bytes().to_vec();
+            xf.extend(id.to_le_bytes());
+            stream.extend(record(0x00E0, &xf));
+        }
+        stream.extend(record(0x000A, &[]));
+        let (xls, _) = biff_formats(&stream);
+        for xfs in [xlsx, xls] {
+            let shown: Vec<String> = xfs
+                .iter()
+                .map(|code| displayed_text(&Data::Float(-1234.5), code.as_deref(), false))
+                .collect();
+            assert_eq!(
+                shown,
+                ["-1,235", "-1,235", "-1,234.50", "-1,234.50", "(1,235)"]
+            );
+            assert_eq!(
+                displayed_text(&Data::Float(1234.5), xfs[0].as_deref(), false),
+                "1,235"
+            );
+        }
     }
 
     /// The cell-style readers: a styles part with custom and built-in ids, a

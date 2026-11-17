@@ -1,7 +1,10 @@
 //! #634: a cell's text is what Excel displays — its value through its number
 //! format, by docling PR #4628's rules. The expected strings are that PR's
 //! own code (`_displayed_cell_text`, head `ab177e1`) run through openpyxl
-//! 3.1.5 on these very workbooks, so the oracle is upstream, not us.
+//! 3.1.5 on these very workbooks, so the oracle is upstream, not us —
+//! except where `numfmt::format_plain_number` goes beyond the PR: `"EUR"`,
+//! `#,##0` and `00000`, which the PR leaves raw, read as Excel shows them,
+//! in the PR's US spelling.
 //!
 //! Fixtures (own, `crates/docling/tests/data/{xlsx,xls}/sources`):
 //! `xlsx_number_formats_min.xlsx`/`.xls` — the issue's repro, one value per
@@ -52,8 +55,8 @@ fn rows(rows: &[&[&str]]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The issue's repro: `0.0%` renders, `dd/mm/yyyy` renders, and — exactly
-/// as the PR has it — `"EUR"`, `#,##0`, `00000` and `General` stay raw.
+/// The issue's repro: `0.0%` renders, `dd/mm/yyyy` renders, `"EUR"`,
+/// `#,##0` and `00000` render beyond the PR, and `General` stays raw.
 #[test]
 fn reporter_workbook_matches_the_pr() {
     let doc = convert("xlsx", "xlsx_number_formats_min.xlsx");
@@ -62,10 +65,10 @@ fn reporter_workbook_matches_the_pr() {
         vec![rows(&[
             &["label", "value", "number_format"],
             &["percent 0.0%", "15.0%", "0.0%"],
-            &["currency", "1234.5", "\"EUR\" #,##0.00"],
+            &["currency", "EUR 1,234.50", "\"EUR\" #,##0.00"],
             &["date dd/mm/yyyy", "31/01/2024", "dd/mm/yyyy"],
-            &["thousands", "1234567.891", "#,##0"],
-            &["zero padded", "42", "00000"],
+            &["thousands", "1,234,568", "#,##0"],
+            &["zero padded", "00042", "00000"],
             &["General", "3.14159", "General"],
         ])]
     );
@@ -82,10 +85,10 @@ fn reporter_xls_reads_biff_formats() {
         vec![rows(&[
             &["label", "value", "number_format"],
             &["percent 0.0%", "15.0%", "0.0%"],
-            &["currency", "1234.5", "\"EUR\" #,##0.00"],
+            &["currency", "EUR 1,234.50", "\"EUR\" #,##0.00"],
             &["date dd/mm/yyyy", "2024-01-31", "dd/mm/yyyy"],
-            &["thousands", "1234567.891", "#,##0"],
-            &["zero padded", "42", "00000"],
+            &["thousands", "1,234,568", "#,##0"],
+            &["zero padded", "00042", "00000"],
             &["General", "3.14159", "General"],
         ])]
     );
@@ -148,9 +151,10 @@ fn order_and_review_sheets_match_the_pr() {
             ("Conditional raw", "0.125"),
             ("Optional decimals raw", "12.5"),
             ("Digit literal raw", "12.5"),
-            ("EUR raw", "1234.5"),
-            ("Thousands raw", "1234567.891"),
-            ("Padded raw", "42"),
+            // The fixture's "raw" labels are the PR's; these three render now.
+            ("EUR raw", "EUR 1,234.50"),
+            ("Thousands raw", "1,234,568"),
+            ("Padded raw", "00042"),
             ("Large", "$123,456,789,012.35"),
             ("Tiny", "0.00%"),
             ("Text format", "3.5"),

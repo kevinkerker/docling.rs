@@ -37,9 +37,9 @@
 | Conditional raw       | 0.125                      | [>=1]0%;0.0%                  |
 | Optional decimals raw | 12.5                       | "$"0.##                       |
 | Digit literal raw     | 12.5                       | "$0"0.00                      |
-| EUR raw               | 1234.5                     | "EUR" #,##0.00                |
-| Thousands raw         | 1234567.891                | #,##0                         |
-| Padded raw            | 42                         | 00000                         |
+| EUR raw               | EUR 1,234.50               | "EUR" #,##0.00                |
+| Thousands raw         | 1,234,568                  | #,##0                         |
+| Padded raw            | 00042                      | 00000                         |
 | Large                 | $123,456,789,012.35        | "$"#,##0.00                   |
 | Tiny                  | 0.00%                      | 0.00%                         |
 | Text format           | 3.5                        | @                             |
