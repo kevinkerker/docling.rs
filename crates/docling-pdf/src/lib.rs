@@ -643,6 +643,106 @@ fn image_page_dpi(bytes: &[u8], decoded: (u32, u32)) -> (f64, f64) {
     }
 }
 
+/// The pages of a classic TIFF (`II*\0` / `MM\0*`): the offset of each
+/// page's IFD, following the chain from the header. A reduced-resolution
+/// copy (a thumbnail) or a transparency mask (`NewSubfileType` bit 0 or 2,
+/// `SubfileType` 2) is not a page. The walk ends at the chain's end or at
+/// an IFD it has seen (a loop). An IFD pointer past the file, an IFD cut
+/// short or more than 10 000 IFDs make a damaged file and an error, not the
+/// pages before it — for a one-page file too. Empty for any other file —
+/// BigTIFF (`II+\0`) included, which the image decoder does not read at all.
+#[cfg(feature = "ml")]
+fn tiff_page_ifds(bytes: &[u8]) -> Result<Vec<u32>, PdfError> {
+    const MAX_IFDS: usize = 10_000;
+    let le = match bytes.get(0..4) {
+        Some(b"II*\0") => true,
+        Some(b"MM\0*") => false,
+        _ => return Ok(Vec::new()),
+    };
+    let u16_at = |o: usize| -> Option<u16> {
+        let b: [u8; 2] = bytes.get(o..o.checked_add(2)?)?.try_into().ok()?;
+        Some(if le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
+    };
+    let u32_at = |o: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(o..o.checked_add(4)?)?.try_into().ok()?;
+        Some(if le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
+    };
+    let past = |at: u32| {
+        PdfError::Pdfium(format!(
+            "image: damaged TIFF: the IFD at byte {at} lies past the end of the file"
+        ))
+    };
+    let cut = |at: u32| {
+        PdfError::Pdfium(format!(
+            "image: damaged TIFF: the IFD at byte {at} is cut short"
+        ))
+    };
+    let mut pages = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut next = u32_at(4).unwrap_or(0);
+    while next != 0 && seen.insert(next) {
+        if seen.len() > MAX_IFDS {
+            return Err(PdfError::Pdfium(format!(
+                "image: damaged TIFF: more than {MAX_IFDS} IFDs"
+            )));
+        }
+        let at = next as usize;
+        let count = u16_at(at).ok_or_else(|| past(next))?;
+        let entries = at + 2;
+        let after = u32_at(entries + 12 * count as usize).ok_or_else(|| cut(next))?;
+        // A SHORT or LONG value sits in the entry itself; SHORT in its
+        // first two bytes.
+        let value = |e: usize| match u16_at(e + 2) {
+            Some(3) => u16_at(e + 8).map(u32::from),
+            Some(4) => u32_at(e + 8),
+            _ => None,
+        };
+        let not_a_page = (0..count as usize).any(|i| {
+            let e = entries + 12 * i;
+            match u16_at(e) {
+                Some(254) => value(e).is_some_and(|v| v & 0b101 != 0),
+                Some(255) => value(e) == Some(2),
+                _ => false,
+            }
+        });
+        if !not_a_page {
+            pages.push(next);
+        }
+        next = after;
+    }
+    Ok(pages)
+}
+
+/// One page of a multi-page TIFF as `convert_image` builds a single image:
+/// `file` (a copy of the TIFF, reused for every page) gets its header
+/// pointed at the page's IFD — one of [`tiff_page_ifds`] — so the image
+/// decoder, the EXIF orientation and [`image_page_dpi`] all read that page.
+/// With the page, the factors from its pixels to points (`72 / dpi`).
+#[cfg(feature = "ml")]
+fn tiff_page_input(file: &mut [u8], ifd: u32) -> Result<(PdfPage, (f32, f32)), PdfError> {
+    let at = if file.starts_with(b"II") {
+        ifd.to_le_bytes()
+    } else {
+        ifd.to_be_bytes()
+    };
+    file[4..8].copy_from_slice(&at);
+    let image = decode_image_limited(file)?;
+    let (w, h) = image.dimensions();
+    let (dpi_x, dpi_y) = image_page_dpi(file, (w, h));
+    let mut page = PdfPage::from_cells_with_image(w as f32, h as f32, 1.0, Vec::new(), image);
+    // A standalone image is its own scale-1.0 layout image, as there.
+    page.image_layout = Some(page.image.clone());
+    Ok((page, ((72.0 / dpi_x) as f32, (72.0 / dpi_y) as f32)))
+}
+
 /// Whether `bytes` is an ISOBMFF HEIF/HEIC container (the `ftyp` brands
 /// iPhones write). Checked by content, not extension — HEIC regularly
 /// arrives misnamed `.jpg`.
@@ -4428,6 +4528,12 @@ impl Pipeline {
     /// Convert a standalone image (PNG/JPEG/TIFF/WebP/…) as a single page —
     /// docling routes images through the same layout+OCR pipeline as a PDF page.
     pub fn convert_image(&mut self, bytes: &[u8], name: &str) -> Result<DoclingDocument, PdfError> {
+        // A TIFF with several pages (a fax, a scanner's batch) converts as a
+        // document of those pages; one page goes the way it always did.
+        let tiff_pages = tiff_page_ifds(bytes)?;
+        if tiff_pages.len() > 1 {
+            return self.convert_tiff_pages(bytes, &tiff_pages, name);
+        }
         let image = decode_image_limited(bytes)?;
         let (w, h) = image.dimensions();
         // The image is its own page rendered at 1 px per "point" (scale 1.0); a
@@ -4471,18 +4577,60 @@ impl Pipeline {
     /// caller-configured pipeline (#244).
     pub fn process_pages(
         &mut self,
-        mut pages: Vec<PdfPage>,
+        pages: Vec<PdfPage>,
+        name: &str,
+    ) -> Result<DoclingDocument, PdfError> {
+        let total = pages.len();
+        self.process_page_stream(pages.into_iter().map(|p| Ok((p, (1.0, 1.0)))), total, name)
+    }
+
+    /// The pages of a multi-page TIFF ([`tiff_page_ifds`]) as one document:
+    /// each page decoded only when its turn comes (one bitmap resident at a
+    /// time, one copy of the file for all pages), converted like a single
+    /// image, numbered in file order and sized from its own resolution
+    /// (#1093) — pages of one file may differ in size and resolution. A page
+    /// that does not decode fails the whole conversion.
+    fn convert_tiff_pages(
+        &mut self,
+        bytes: &[u8],
+        ifds: &[u32],
+        name: &str,
+    ) -> Result<DoclingDocument, PdfError> {
+        let mut file = bytes.to_vec();
+        let pages = ifds.iter().map(|&ifd| tiff_page_input(&mut file, ifd));
+        self.process_page_stream(pages, ifds.len(), name)
+    }
+
+    /// [`Self::process_pages`] over pages produced one at a time, each with
+    /// the factors its page units are rescaled by once it is converted
+    /// (`(1.0, 1.0)`: left as they are) — what [`Self::convert_image`] does to its
+    /// one page after the fact, done here page by page.
+    fn process_page_stream(
+        &mut self,
+        pages: impl Iterator<Item = Result<(PdfPage, (f32, f32)), PdfError>>,
+        total: usize,
         name: &str,
     ) -> Result<DoclingDocument, PdfError> {
         let mut doc = DoclingDocument::new(name);
         let mut confs = std::collections::BTreeMap::new();
         let mut ocr_cells_by_page = std::collections::BTreeMap::new();
         let progress = self.progress.clone();
-        let total = pages.len();
         let worker = self.primary()?;
-        for (n, page) in pages.iter_mut().enumerate() {
-            let (mut nodes, links, conf, page_image, ocr_cells) = worker.process(n, page)?;
+        for (n, page) in pages.enumerate() {
+            let (mut page, (sx, sy)) = page?;
+            let (mut nodes, links, conf, mut page_image, ocr_cells) =
+                worker.process(n, &mut page)?;
             assemble::stamp_page_no(&mut nodes, n + 1);
+            if (sx, sy) != (1.0, 1.0) {
+                let mut part = DoclingDocument::new(name);
+                part.nodes = nodes;
+                if let Some(img) = page_image {
+                    part.page_images.insert(n + 1, img);
+                }
+                part.rescale_page_units(sx, sy);
+                nodes = part.nodes;
+                page_image = part.page_images.remove(&(n + 1));
+            }
             if let Some(img) = page_image {
                 doc.page_images.insert(n + 1, img);
             }
@@ -4708,6 +4856,257 @@ mod image_limit_tests {
         assert!(
             r.is_err(),
             "decode must fail under the pixel cap, not abort"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ml"))]
+mod tiff_page_tests {
+    use super::{tiff_page_ifds, tiff_page_input, Pipeline};
+
+    /// One page of [`tiff`]: uncompressed 8-bit gray, `w` × `h` pixels, the
+    /// resolution `dpi` per axis, and the subfile tags (254, 255).
+    #[derive(Clone, Copy)]
+    struct Page {
+        w: u32,
+        h: u32,
+        dpi: (u32, u32),
+        new_subfile: u32,
+        old_subfile: Option<u32>,
+    }
+
+    fn page(w: u32, h: u32, dpi: u32) -> Page {
+        Page {
+            w,
+            h,
+            dpi: (dpi, dpi),
+            new_subfile: 0,
+            old_subfile: None,
+        }
+    }
+
+    /// A TIFF of `pages`, little- or big-endian, the IFDs chained in order.
+    fn tiff(le: bool, pages: &[Page]) -> Vec<u8> {
+        let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut out = if le {
+            b"II*\0".to_vec()
+        } else {
+            b"MM\0*".to_vec()
+        };
+        let mut link = out.len();
+        out.extend(u32b(0));
+        for p in pages {
+            let data = out.len() as u32;
+            out.extend(std::iter::repeat_n(200u8, (p.w * p.h) as usize));
+            let (xres, yres) = (out.len() as u32, out.len() as u32 + 8);
+            for v in [p.dpi.0, 1, p.dpi.1, 1] {
+                out.extend(u32b(v));
+            }
+            let ifd = out.len() as u32;
+            out[link..link + 4].copy_from_slice(&u32b(ifd));
+            // (tag, type: 3 SHORT / 4 LONG / 5 RATIONAL, value or offset)
+            let mut entries: Vec<(u16, u16, u32)> = vec![(254, 4, p.new_subfile)];
+            if let Some(v) = p.old_subfile {
+                entries.push((255, 3, v));
+            }
+            entries.extend([
+                (256, 4, p.w),
+                (257, 4, p.h),
+                (258, 3, 8),
+                (259, 3, 1),
+                (262, 3, 1),
+                (273, 4, data),
+                (277, 3, 1),
+                (278, 4, p.h),
+                (279, 4, p.w * p.h),
+                (282, 5, xres),
+                (283, 5, yres),
+                (296, 3, 2),
+            ]);
+            out.extend(u16b(entries.len() as u16));
+            for (tag, ty, v) in entries {
+                out.extend(u16b(tag));
+                out.extend(u16b(ty));
+                out.extend(u32b(1));
+                if ty == 3 {
+                    out.extend(u16b(v as u16));
+                    out.extend([0, 0]);
+                } else {
+                    out.extend(u32b(v));
+                }
+            }
+            link = out.len();
+            out.extend(u32b(0));
+        }
+        out
+    }
+
+    /// Each page of a multi-page TIFF decodes on its own, with its own size
+    /// and resolution per axis, in either byte order, as the page a single
+    /// image makes (with its own layout image); a thumbnail
+    /// (`NewSubfileType` bit 0), a mask (bit 2) and an old-style reduced
+    /// image (`SubfileType` 2) are not pages.
+    #[test]
+    fn each_tiff_page_decodes_with_its_own_size_and_resolution() {
+        let thumb = Page {
+            new_subfile: 1,
+            ..page(8, 8, 72)
+        };
+        let mask = Page {
+            new_subfile: 4,
+            ..page(8, 8, 72)
+        };
+        let reduced = Page {
+            old_subfile: Some(2),
+            ..page(8, 8, 72)
+        };
+        let full_old = Page {
+            old_subfile: Some(1),
+            ..page(30, 10, 72)
+        };
+        let wide = Page {
+            dpi: (150, 300),
+            ..page(90, 30, 150)
+        };
+        for le in [true, false] {
+            let mut bytes = tiff(
+                le,
+                &[
+                    page(40, 60, 72),
+                    wide,
+                    thumb,
+                    mask,
+                    reduced,
+                    full_old,
+                    page(20, 20, 288),
+                ],
+            );
+            let ifds = tiff_page_ifds(&bytes).unwrap();
+            assert_eq!(ifds.len(), 4, "thumbnail, mask and reduced image skipped");
+            let got: Vec<((u32, u32), (f32, f32))> = ifds
+                .iter()
+                .map(|&ifd| {
+                    let (page, units) = tiff_page_input(&mut bytes, ifd).unwrap();
+                    let layout = page.image_layout.as_ref().expect("the layout image");
+                    assert_eq!(layout, &page.image);
+                    assert_eq!(
+                        (page.width, page.height, page.scale),
+                        (layout.width() as f32, layout.height() as f32, 1.0)
+                    );
+                    (page.image.dimensions(), units)
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ((40, 60), (1.0, 1.0)),
+                    ((90, 30), (0.48, 0.24)),
+                    ((30, 10), (1.0, 1.0)),
+                    ((20, 20), (0.25, 0.25)),
+                ]
+            );
+        }
+    }
+
+    /// One page, or none to count as in any other file, keeps the
+    /// single-image path; a loop ends the walk; 10 000 IFDs are read, one
+    /// more is an error.
+    #[test]
+    fn the_page_walk_is_bounded() {
+        let one = tiff(true, &[page(4, 4, 72)]);
+        assert_eq!(tiff_page_ifds(&one).unwrap().len(), 1);
+        assert!(tiff_page_ifds(b"\x89PNG\r\n\x1a\n").unwrap().is_empty());
+        let bigtiff = b"II+\0\x08\0\0\0\x10\0\0\0\0\0\0\0";
+        assert!(tiff_page_ifds(bigtiff).unwrap().is_empty());
+        // The last IFD points back to the first.
+        let mut looped = tiff(true, &[page(4, 4, 72), page(4, 4, 72)]);
+        let first = u32::from_le_bytes(looped[4..8].try_into().unwrap());
+        let n = looped.len();
+        looped[n - 4..].copy_from_slice(&first.to_le_bytes());
+        assert_eq!(tiff_page_ifds(&looped).unwrap().len(), 2);
+        let most = tiff(true, &vec![page(1, 1, 72); 10_000]);
+        assert_eq!(tiff_page_ifds(&most).unwrap().len(), 10_000);
+        let many = tiff(true, &vec![page(1, 1, 72); 10_001]);
+        let err = tiff_page_ifds(&many).unwrap_err();
+        assert!(err.to_string().contains("more than 10000 IFDs"), "{err}");
+    }
+
+    /// A chain cut short or pointing past the file is a damaged file: an
+    /// error, not the pages before the damage.
+    #[test]
+    fn a_broken_page_chain_is_an_error() {
+        let bytes = tiff(true, &[page(40, 40, 72); 5]);
+        let ifds = tiff_page_ifds(&bytes).unwrap();
+        let fifth = ifds[4] as usize;
+        for (cut, says) in [
+            (fifth, "lies past the end"),
+            (fifth + 1, "lies past the end"),
+            (fifth + 20, "is cut short"),
+            (bytes.len() - 2, "is cut short"),
+        ] {
+            let err = tiff_page_ifds(&bytes[..cut]).unwrap_err();
+            assert!(err.to_string().contains(says), "{cut}: {err}");
+        }
+        // One page whose link points past the file: an error as well.
+        let mut one = tiff(true, &[page(4, 4, 72)]);
+        let n = one.len();
+        one[n - 4..].copy_from_slice(&1_000_000u32.to_le_bytes());
+        let err = tiff_page_ifds(&one).unwrap_err();
+        assert!(err.to_string().contains("lies past the end"), "{err}");
+        // The first IFD's link points far past the end.
+        let mut dangling = bytes.clone();
+        let link = ifds[0] as usize + 2 + 13 * 12;
+        dangling[link..link + 4].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(tiff_page_ifds(&dangling).is_err());
+        // The conversion fails with it; it does not return four pages.
+        let err = Pipeline::new()
+            .unwrap()
+            .no_ocr(true)
+            .convert_image(&bytes[..fifth + 20], "cut.tif")
+            .unwrap_err();
+        assert!(err.to_string().contains("damaged TIFF"), "{err}");
+    }
+
+    /// The conversion has every page, numbered in file order and sized in
+    /// points from its own resolution per axis (#1093); a one-page TIFF is
+    /// unchanged. `no_ocr` loads no model.
+    #[test]
+    fn a_multi_page_tiff_converts_every_page() {
+        let pages = |bytes: &[u8]| -> Vec<(usize, f32, f32)> {
+            let doc = Pipeline::new()
+                .unwrap()
+                .no_ocr(true)
+                .convert_image(bytes, "pages.tif")
+                .unwrap();
+            let sizes: Vec<(usize, f32, f32)> = doc
+                .nodes
+                .iter()
+                .filter_map(|n| match n {
+                    docling_core::Node::PageInfo {
+                        page_no,
+                        width,
+                        height,
+                    } => Some((*page_no, *width, *height)),
+                    _ => None,
+                })
+                .collect();
+            let conf = doc.confidence.as_ref().unwrap();
+            assert_eq!(conf.pages.len(), sizes.len());
+            sizes
+        };
+        let wide = Page {
+            dpi: (144, 288),
+            ..page(300, 150, 144)
+        };
+        let three = tiff(true, &[page(100, 200, 72), wide, page(48, 48, 288)]);
+        assert_eq!(
+            pages(&three),
+            vec![(1, 100.0, 200.0), (2, 150.0, 37.5), (3, 12.0, 12.0)]
+        );
+        assert_eq!(
+            pages(&tiff(true, &[page(300, 150, 144)])),
+            vec![(1, 150.0, 75.0)]
         );
     }
 }
