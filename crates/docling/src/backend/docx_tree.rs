@@ -38,10 +38,10 @@ use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use super::docx::{
     attr, build_enum_marker, caption_numbering_marker, chart_rels, child_elements,
-    clean_checkbox_symbols, detect_code_language, footnote_texts, get_list_counter, grid_span,
-    header_footer_parts, heading_labels, hyperlink_target, in_textbox, inherited_outline,
-    is_code_by_font, is_code_style, is_title_style, numbered_heading_text, on_off,
-    paragraph_anchors, part_rels, revision_of, row_cells, row_grid_offsets, row_kept,
+    clean_checkbox_symbols, detect_code_language, english_heading_label, footnote_texts,
+    get_list_counter, grid_span, header_footer_parts, heading_labels, hyperlink_target, in_textbox,
+    inherited_outline, is_code_by_font, is_code_style, is_title_style, numbered_heading_text,
+    on_off, paragraph_anchors, part_rels, revision_of, row_cells, row_grid_offsets, row_kept,
     run_child_text, style_chain_bold, style_numbering, sync_heading_counter, t_text, Ctx,
     MAX_TABLE_DEPTH,
 };
@@ -1139,7 +1139,7 @@ impl Walker {
                 return ("Heading".into(), Some(o));
             }
             if let Some(l) = labels.iter().find(|l| l.to_lowercase().contains("heading")) {
-                return Self::heading_and_level(l);
+                return Self::heading_and_level(english_heading_label(l));
             }
         }
         if is_code_style(style_id, ctx)
@@ -1153,6 +1153,15 @@ impl Walker {
             if !is_title_style(style_id, name, ctx) {
                 return ("Heading".into(), Some(o));
             }
+        }
+        // Word stores a built-in style under an id in the language of its
+        // interface (`Titel`, `Titre`) and keeps the language-neutral name
+        // (`Title`) in `w:name`: the title is the style so named, as for
+        // the Markdown (`named_heading_level`). A style of the user's own
+        // named `Title` gets the id `Title` too (Word refuses only the
+        // localized built-in name), so it was a title before as well.
+        if name.eq_ignore_ascii_case("title") {
+            return ("Title".into(), None);
         }
         (label.to_string(), None)
     }
@@ -1917,6 +1926,7 @@ impl Walker {
                 nid,
                 ilvl,
                 &p_style_id,
+                ctx.style_names.get(&p_style_id).map_or("", String::as_str),
             );
             if let Some(marker) = marker {
                 if let Some(el) = elements.iter_mut().find(|e| !e.text.trim().is_empty()) {
@@ -3015,6 +3025,225 @@ mod tests {
         );
         for (i, t) in texts.iter().enumerate() {
             assert_eq!(t["self_ref"], format!("#/texts/{i}"));
+        }
+    }
+
+    /// A package of `styles` (`(id, name, basedOn, own pPr)`) and `body`
+    /// paragraphs, with a two-level numbering whose second level is
+    /// `Part %1.%2` (`numId` 1).
+    fn styled_docx(styles: &[(&str, &str, Option<&str>, &str)], body: &str) -> Vec<u8> {
+        use std::io::Write;
+        let styles: String = styles
+            .iter()
+            .map(|(id, name, based, ppr)| {
+                let based = based.map_or(String::new(), |b| format!(r#"<w:basedOn w:val="{b}"/>"#));
+                format!(
+                    r#"<w:style w:type="paragraph" w:styleId="{id}"><w:name w:val="{name}"/>{based}<w:pPr>{ppr}</w:pPr></w:style>"#
+                )
+            })
+            .collect();
+        let parts = [
+            (
+                "word/document.xml",
+                format!(r#"<w:document xmlns:w="{W}"><w:body>{body}</w:body></w:document>"#),
+            ),
+            (
+                "word/styles.xml",
+                format!(r#"<w:styles xmlns:w="{W}">{styles}</w:styles>"#),
+            ),
+            (
+                "word/numbering.xml",
+                format!(
+                    r#"<w:numbering xmlns:w="{W}"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="Part %1.%2"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+                ),
+            ),
+        ];
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in &parts {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(content.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    fn para(style: &str, text: &str) -> String {
+        format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    }
+
+    /// `(label, text)` of the body's first item and the converted document.
+    fn first_label(
+        styles: &[(&str, &str, Option<&str>, &str)],
+        body: &str,
+    ) -> (String, docling_core::DoclingDocument) {
+        let src =
+            SourceDocument::from_bytes("t.docx", InputFormat::Docx, styled_docx(styles, body));
+        let doc = DocxBackend::default().convert(&src).expect("converts");
+        let tree = doc.tree.as_ref().expect("tree");
+        let first = tree.body[0];
+        (label_of(&tree.items[first].kind), doc)
+    }
+
+    /// Word stores a built-in style under an id in the language of its user
+    /// interface (`Titel`, `Titre`) and its language-neutral name in
+    /// `w:name` (`Title`): the title is found by either, so a document from
+    /// a German or French Word has its title and its headings below it, as
+    /// one from an English Word does.
+    #[test]
+    fn a_localized_title_style_is_the_title() {
+        for (title, heading) in [
+            ("Title", "Heading1"),
+            ("Titel", "berschrift1"),
+            ("Titre", "Titre1"),
+        ] {
+            let styles = [
+                (title, "Title", None, ""),
+                (heading, "heading 1", None, r#"<w:outlineLvl w:val="0"/>"#),
+            ];
+            let body = para(title, "The title") + &para(heading, "A chapter");
+            let (label, doc) = first_label(&styles, &body);
+            assert_eq!(label, "title", "{title}");
+            let tree = doc.tree.as_ref().unwrap();
+            let chapter = tree
+                .items
+                .iter()
+                .position(|it| text_of(&it.kind) == "A chapter")
+                .unwrap();
+            assert_eq!(tree.items[chapter].parent, Some(tree.body[0]), "{title}");
+            assert!(
+                doc.export_to_markdown().starts_with("# The title"),
+                "{title}"
+            );
+        }
+    }
+
+    /// The other way round: a style of the workbook's own that happens to be
+    /// called `Titel` (an English Word's custom style: id and name `Titel`)
+    /// is not the built-in title, and neither is a style derived from the
+    /// title under a name of its own — both stay text, as before.
+    #[test]
+    fn a_custom_style_called_titel_is_no_title() {
+        let (label, _) = first_label(&[("Titel", "Titel", None, "")], &para("Titel", "Custom"));
+        assert_eq!(label, "text");
+        for (base, derived) in [("Title", "MyTitle"), ("Titel", "MeinTitel")] {
+            let styles = [
+                (base, "Title", None, ""),
+                (derived, "My Title", Some(base), ""),
+            ];
+            let (label, _) = first_label(&styles, &para(derived, "Derived"));
+            assert_eq!(label, "text", "{derived}");
+        }
+    }
+
+    /// A list paragraph in a list style keeps its list numbering, whatever
+    /// language the style's id is in: a German Word's `Aufzhlungszeichen`
+    /// (`List Bullet`) and `Standard` (`Normal`) read exactly like
+    /// `ListBullet` and `Normal`, not like a caption numbered through a
+    /// heading-relative `Part %1.%2`.
+    #[test]
+    fn localized_list_styles_keep_their_list_numbering() {
+        let read = |style: &str, name: &str| {
+            let item = |ilvl: u8, text: &str| {
+                format!(
+                    r#"<w:p><w:pPr><w:pStyle w:val="{style}"/><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+                )
+            };
+            let body = item(0, "Outer") + &item(1, "Inner");
+            let src = SourceDocument::from_bytes(
+                "t.docx",
+                InputFormat::Docx,
+                styled_docx(&[(style, name, None, "")], &body),
+            );
+            let doc = DocxBackend::default().convert(&src).expect("converts");
+            let tree = doc.tree.as_ref().unwrap();
+            let inner = tree
+                .items
+                .iter()
+                .find(|it| text_of(&it.kind).ends_with("Inner"))
+                .unwrap();
+            (
+                label_of(&inner.kind),
+                text_of(&inner.kind).to_string(),
+                doc.export_to_markdown(),
+            )
+        };
+        for (english, localized, name) in [
+            ("ListBullet", "Aufzhlungszeichen", "List Bullet"),
+            ("Normal", "Standard", "Normal"),
+        ] {
+            let expected = read(english, name);
+            assert_eq!(expected.0, "list_item", "{english}");
+            assert_eq!(read(localized, name), expected, "{localized}");
+        }
+    }
+
+    /// A built-in style named `title` in lower case is the title too.
+    #[test]
+    fn a_title_name_in_lower_case_is_the_title() {
+        let (label, _) = first_label(&[("Titel", "title", None, "")], &para("Titel", "T"));
+        assert_eq!(label, "title");
+    }
+
+    /// `index heading` and `toa heading` — the built-in names that say
+    /// "heading" in lower case without a level — read the same whatever the
+    /// language of the id: as with English Word's `IndexHeading` and
+    /// `TOAHeading`, in the tree and in the Markdown.
+    #[test]
+    fn index_and_toa_headings_read_alike_in_every_language() {
+        let read = |id: &str, name: &str| {
+            let (label, doc) = first_label(&[(id, name, None, "")], &para(id, "Index"));
+            let tree = doc.tree.as_ref().unwrap();
+            let level = match &tree.items[tree.body[0]].kind {
+                TreeKind::Text { level, .. } => *level,
+                _ => None,
+            };
+            (label, level, doc.export_to_markdown())
+        };
+        for (english, localized, name) in [
+            ("IndexHeading", "Indexberschrift", "index heading"),
+            ("IndexHeading", "Titreindex", "index heading"),
+            ("TOAHeading", "RGV-berschrift", "toa heading"),
+        ] {
+            let expected = read(english, name);
+            assert_eq!(expected.0, "section_header", "{english}");
+            assert_eq!(read(localized, name), expected, "{localized}");
+        }
+    }
+
+    /// The list exception reads a name only where it is a built-in one,
+    /// at a word boundary: another program's own style `Listing Caption` or
+    /// `My List Style` keeps its heading-relative caption number as text,
+    /// as before.
+    #[test]
+    fn only_builtin_list_names_drop_the_caption_number() {
+        for (id, name) in [
+            ("Codebeschriftung", "Listing Caption"),
+            ("MyStyle", "My List Style"),
+            ("Hinweis", "Normality"),
+        ] {
+            let item = |ilvl: u8, text: &str| {
+                format!(
+                    r#"<w:p><w:pPr><w:pStyle w:val="{id}"/><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+                )
+            };
+            let body = item(0, "Outer") + &item(1, "Inner");
+            let src = SourceDocument::from_bytes(
+                "t.docx",
+                InputFormat::Docx,
+                styled_docx(&[(id, name, None, "")], &body),
+            );
+            let doc = DocxBackend::default().convert(&src).expect("converts");
+            let tree = doc.tree.as_ref().unwrap();
+            let inner = tree
+                .items
+                .iter()
+                .find(|it| text_of(&it.kind).ends_with("Inner"))
+                .unwrap();
+            assert_eq!(label_of(&inner.kind), "text", "{name}");
+            assert_eq!(text_of(&inner.kind), "Part 1.1 Inner", "{name}");
         }
     }
 }

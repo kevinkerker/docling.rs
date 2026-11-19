@@ -1246,6 +1246,7 @@ fn handle_paragraph_body(
             } else {
                 style_id
             },
+            &style_name,
         )
     });
     let (numbering, text) = match caption_marker {
@@ -1801,10 +1802,27 @@ fn named_heading_level(style_id: &str, style_name: &str, ctx: &Ctx) -> Option<u8
     }
     for label in heading_labels(style_id, style_name, ctx) {
         if label.to_ascii_lowercase().contains("heading") {
-            return heading_label_level(label);
+            return heading_label_level(english_heading_label(label));
         }
     }
     None
+}
+
+/// The id English Word writes for a built-in style whose name says
+/// "heading" in lower case without a level — `index heading`, `toa heading`.
+/// The heading rules recognise a level-less heading only by a capital-H
+/// "Heading" (docling's case-sensitive `"Heading" in p_style_id`), which the
+/// English id has and the name lacks; a label taken from the name reads as
+/// that id, so a file whose ids are in another language (`Indexberschrift`)
+/// reads like one from an English Word. Any other label is returned as is.
+pub(super) fn english_heading_label(label: &str) -> &str {
+    if label.eq_ignore_ascii_case("index heading") {
+        "IndexHeading"
+    } else if label.eq_ignore_ascii_case("toa heading") {
+        "TOAHeading"
+    } else {
+        label
+    }
 }
 
 /// docling's `_get_heading_and_level` + `_split_text_and_number` on one label,
@@ -3999,7 +4017,9 @@ pub(super) fn build_enum_marker(
 /// belongs in its text rather than making it a list item — docling's
 /// `_get_caption_numbering_marker` (docling#4727, #765). It applies to a
 /// paragraph outside the Title / Heading / Code / `List…` / `Normal…`
-/// styles whose level template references a shallower level (`%1` in
+/// styles — by id, or by the language-neutral built-in `style_name` (`List
+/// …`, `Normal …`) of a style whose id is in the language of Word's
+/// interface (`Aufzhlungszeichen`, named `List Bullet`) — whose level template references a shallower level (`%1` in
 /// `Tabell %1.%7`, typically a heading counter) and has a letter in its
 /// literal part. The counter is advanced and the marker built like a list
 /// item's; `None` leaves the paragraph to the list handling.
@@ -4009,11 +4029,19 @@ pub(super) fn caption_numbering_marker(
     num_id: &str,
     ilvl: i64,
     style_id: &str,
+    style_name: &str,
 ) -> Option<String> {
     let lower = style_id.to_lowercase();
+    // The built-in names only (`List Bullet`, `Normal Indent`), at a word
+    // boundary: a name such as `Listing Caption` of another program's own
+    // style keeps its caption number.
+    let name = style_name.to_lowercase();
+    let builtin = |word: &str| name == word || name.starts_with(&format!("{word} "));
     if matches!(style_id, "Title" | "Heading" | "Code")
         || lower.starts_with("list")
         || lower.starts_with("normal")
+        || builtin("list")
+        || builtin("normal")
     {
         return None;
     }
